@@ -30,6 +30,8 @@
 #error "No configuration file"
 #endif
 
+#include <vector>
+
 #include "globals.h"
 #include "rts_module.h"
 #include "save_vec.h"
@@ -132,6 +134,10 @@ public:
     virtual uintptr_t currentStackSpace(void) const = 0;
     // Add a count to the local function if we are using store profiling.
     virtual void addProfileCount(POLYUNSIGNED words) = 0;
+
+    // Walk the ML stack and collect the code objects for each stack frame.
+    // Used to implement PolyML.stackTrace.
+    virtual void GetStackTrace(std::vector<PolyObject*>& codeObjects) {}
 
     // Functions called before and after an RTS call.
     virtual void PreRTSCall(void) { saveVec.init(); }

@@ -88,6 +88,8 @@ in
     
         val fullGC: unit -> unit = RunCall.rtsCallFull0 "PolyFullGC"
 
+        val stackTrace: unit -> string list = RunCall.rtsCallFull0 "PolyGetStackTrace"
+
         val pointerEq = RunCall.pointerEq
 
         val rtsVersion: unit -> int = RunCall.rtsCallFast0 "PolyGetPolyVersionNumber"

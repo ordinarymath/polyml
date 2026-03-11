@@ -40,6 +40,8 @@
 #include <string.h>
 #endif
 
+#include <vector>
+
 #include "globals.h"
 #include "poly_specific.h"
 #include "arb.h"
@@ -60,6 +62,7 @@
 extern "C" {
     POLYEXTERNALSYMBOL POLYUNSIGNED PolySpecificGeneral(POLYUNSIGNED threadId, POLYUNSIGNED code, POLYUNSIGNED arg);
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyGetABI();
+    POLYEXTERNALSYMBOL POLYUNSIGNED PolyGetStackTrace(POLYUNSIGNED threadId);
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyLockMutableClosure(POLYUNSIGNED threadId, POLYUNSIGNED closure);
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyCopyByteVecToClosure(POLYUNSIGNED threadId, POLYUNSIGNED byteVec, POLYUNSIGNED closure);
     POLYEXTERNALSYMBOL POLYUNSIGNED PolySetCodeConstant(POLYUNSIGNED closure, POLYUNSIGNED offset, POLYUNSIGNED c, POLYUNSIGNED flags);
@@ -483,6 +486,58 @@ POLYEXTERNALSYMBOL POLYUNSIGNED PolyTest5(POLYUNSIGNED threadId, POLYUNSIGNED ar
 }
 
 
+// Walk the current thread's ML stack and return a list of function name strings,
+// most recent call first.  Only implemented for x86/x86_64 native code; returns
+// an empty list on other architectures.
+POLYUNSIGNED PolyGetStackTrace(POLYUNSIGNED threadId)
+{
+    TaskData *taskData = TaskData::FindTaskForId(threadId);
+    ASSERT(taskData != 0);
+    taskData->PreRTSCall();
+    Handle reset = taskData->saveVec.mark();
+    Handle result = 0;
+
+    try {
+        std::vector<PolyObject*> codeObjects;
+        taskData->GetStackTrace(codeObjects);
+
+        // Build an ML list of strings.  Iterate from the back of the vector
+        // (oldest frame) to the front (most recent), prepending each entry so
+        // that the resulting list has the most-recent call at the head.
+        Handle saved = taskData->saveVec.mark();
+        Handle list = taskData->saveVec.push(ListNull);
+
+        for (int i = (int)codeObjects.size() - 1; i >= 0; i--)
+        {
+            PolyObject *obj = codeObjects[i];
+            PolyWord *firstConstant = machineDependent->ConstPtrForCode(obj);
+            PolyWord nameWord = firstConstant[0];
+
+            // Push the name string onto the save vec so GC can update it.
+            Handle nameHandle;
+            if (nameWord == PolyWord::FromUnsigned(0))
+                nameHandle = taskData->saveVec.push(C_string_to_Poly(taskData, ""));
+            else
+                nameHandle = taskData->saveVec.push(nameWord);
+
+            Handle next = alloc_and_save(taskData, sizeof(ML_Cons_Cell) / sizeof(PolyWord));
+            DEREFLISTHANDLE(next)->h = nameHandle->Word();
+            DEREFLISTHANDLE(next)->t = list->Word();
+
+            taskData->saveVec.reset(saved);
+            list = taskData->saveVec.push(next->Word());
+        }
+
+        result = list;
+    }
+    catch (...) {} // If an ML exception is raised
+
+    taskData->saveVec.reset(reset);
+    taskData->PostRTSCall();
+    if (result == 0) return TAGGED(0).AsUnsigned();
+    else return result->Word().AsUnsigned();
+}
+
 struct _entrypts polySpecificEPT[] =
 {
     { "PolySpecificGeneral",            (polyRTSFunction)&PolySpecificGeneral},
@@ -497,6 +552,7 @@ struct _entrypts polySpecificEPT[] =
     { "PolyGetHeapBase",                (polyRTSFunction)&PolyGetHeapBase },
     { "PolyTest4",                      (polyRTSFunction)&PolyTest4 },
     { "PolyTest5",                      (polyRTSFunction)&PolyTest5 },
+    { "PolyGetStackTrace",              (polyRTSFunction)&PolyGetStackTrace },
 
     { NULL, NULL} // End of list.
 };

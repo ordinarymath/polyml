@@ -225,6 +225,8 @@ public:
 
     virtual void CopyStackFrame(StackObject *old_stack, uintptr_t old_length, StackObject *new_stack, uintptr_t new_length);
 
+    virtual void GetStackTrace(std::vector<PolyObject*>& codeObjects);
+
     void HeapOverflowTrap(byte *pcPtr);
     void StackOverflowTrap(uintptr_t space);
 
@@ -440,6 +442,37 @@ void X86TaskData::ScanStackAddress(ScanAddress *process, stackItem &stackItem, S
 #endif
 }
 
+
+// Walk the ML stack and collect the code objects associated with code return addresses.
+// Used to implement PolyML.stackTrace.
+void X86TaskData::GetStackTrace(std::vector<PolyObject*>& codeObjects)
+{
+    if (stack == 0) return;
+    for (stackItem *q = assemblyInterface.stackPtr; q < (stackItem*)stack->top; q++)
+    {
+#ifdef POLYML32IN64
+        // In 32-in-64 return addresses always have the top 32 bits non-zero.
+        if (q->argValue >= ((uintptr_t)1 << 32))
+        {
+            MemSpace *space = gMem.SpaceForAddress(q->codeAddr - 1);
+            if (space != 0 && space->spaceType == ST_CODE)
+            {
+                PolyObject *obj = gMem.FindCodeObject(q->codeAddr);
+                if (obj != 0)
+                    codeObjects.push_back(obj);
+            }
+        }
+#else
+        MemSpace *space = gMem.SpaceForAddress(q->codeAddr - 1);
+        if (space != 0 && space->spaceType == ST_CODE)
+        {
+            PolyObject *obj = gMem.FindCodeObject(q->codeAddr);
+            if (obj != 0)
+                codeObjects.push_back(obj);
+        }
+#endif
+    }
+}
 
 // Copy a stack
 void X86TaskData::CopyStackFrame(StackObject *old_stack, uintptr_t old_length, StackObject *new_stack, uintptr_t new_length)
