@@ -36,7 +36,8 @@ typedef enum {
     kProfileLiveData,
     kProfileLiveMutables,
     kProfileTimeThread,
-    kProfileMutexContention
+    kProfileMutexContention,
+    kProfileFlamegraph
 } ProfileMode;
 
 extern ProfileMode profileMode;
@@ -52,6 +53,10 @@ extern void incrementCountAsynch(POLYCODEPTR pc);
 // Process the queue of profile pc values if we're time profiling.
 // Only called by the main thread.
 extern void processProfileQueue();
+// Process the flamegraph sample queue. Only called by the main thread.
+extern void processFlameGraphQueue();
+// Add a flamegraph stack sample. Called from signal handler / profiling interrupt.
+extern void addFlameGraphSample(TaskData *taskData, SIGNALCONTEXT *context);
 
 extern void AddObjectProfile(PolyObject *obj);
 

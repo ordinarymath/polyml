@@ -226,6 +226,8 @@ public:
     virtual void CopyStackFrame(StackObject *old_stack, uintptr_t old_length, StackObject *new_stack, uintptr_t new_length);
 
     virtual void GetStackTrace(std::vector<PolyObject*>& codeObjects);
+    virtual void GetStackFramesForFlamegraph(SIGNALCONTEXT *context,
+        PolyObject** frames, int maxDepth, int& depth);
 
     void HeapOverflowTrap(byte *pcPtr);
     void StackOverflowTrap(uintptr_t space);
@@ -469,6 +471,51 @@ void X86TaskData::GetStackTrace(std::vector<PolyObject*>& codeObjects)
             PolyObject *obj = gMem.FindCodeObject(q->codeAddr);
             if (obj != 0)
                 codeObjects.push_back(obj);
+        }
+#endif
+    }
+}
+
+// Walk the ML stack to record code objects for flamegraph profiling.
+// Uses assemblyInterface.stackPtr (the saved ML stack pointer) exactly as
+// GetStackTrace does, so that the frame order is consistent and correct.
+// frames[0] is the most-recent frame; frames[depth-1] is the oldest (root).
+// Called from the signal handler, so we avoid dynamic allocation.
+void X86TaskData::GetStackFramesForFlamegraph(SIGNALCONTEXT * /*context*/,
+    PolyObject** frames, int maxDepth, int& depth)
+{
+    depth = 0;
+    if (stack == 0) return;
+
+    stackItem *sp = assemblyInterface.stackPtr;
+    stackItem *stackTop = (stackItem*)stack->top;
+    if (sp < (stackItem*)stack->bottom || sp >= stackTop)
+        return;
+
+    // Walk the stack looking for ML return addresses, identical to GetStackTrace.
+    // Include ST_PERMANENT so that top-level and built-in callers are captured.
+    for (stackItem *q = sp; q < stackTop && depth < maxDepth; q++)
+    {
+#ifdef POLYML32IN64
+        if (q->argValue >= ((uintptr_t)1 << 32))
+        {
+            MemSpace *space = gMem.SpaceForAddress(q->codeAddr - 1);
+            // too much bloat if (space != 0 && (space->spaceType == ST_CODE || space->spaceType == ST_PERMANENT))
+            if (space != 0 && (space->spaceType == ST_CODE))
+            {
+                PolyObject *obj = gMem.FindCodeObject(q->codeAddr);
+                if (obj != 0)
+                    frames[depth++] = obj;
+            }
+        }
+#else
+        MemSpace *space = gMem.SpaceForAddress(q->codeAddr - 1);
+        // too much bloat if (space != 0 && (space->spaceType == ST_CODE || space->spaceType == ST_PERMANENT))
+        if (space != 0 && (space->spaceType == ST_CODE))
+        {
+            PolyObject *obj = gMem.FindCodeObject(q->codeAddr);
+            if (obj != 0)
+                frames[depth++] = obj;
         }
 #endif
     }

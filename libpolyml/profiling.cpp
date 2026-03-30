@@ -44,6 +44,10 @@
 #define ASSERT(x) 0
 #endif
 
+#include <string>
+#include <vector>
+#include <unordered_map>
+
 #include "globals.h"
 #include "arb.h"
 #include "processes.h"
@@ -61,6 +65,7 @@
 
 extern "C" {
     POLYEXTERNALSYMBOL POLYUNSIGNED PolyProfiling(POLYUNSIGNED threadId, POLYUNSIGNED mode);
+    POLYEXTERNALSYMBOL POLYUNSIGNED PolyFlamegraph(POLYUNSIGNED threadId, POLYUNSIGNED mode);
 }
 
 static long mainThreadCounts[MTP_MAXENTRY];
@@ -128,6 +133,95 @@ typedef struct _PROFENTRY
     PolyWord functionName;
     struct _PROFENTRY *nextEntry;
 } PROFENTRY, *PPROFENTRY;
+
+// Flamegraph support: queue of stack samples captured during profiling.
+// Each sample stores up to FG_MAX_DEPTH code object pointers (most recent first).
+// The queue is written by the signal handler / profiling interrupt and read by
+// the main thread in processFlameGraphQueue().
+#define FG_MAX_DEPTH    64
+#define FG_QUEUE_SIZE   10000
+
+struct StackSample
+{
+    PolyObject* frames[FG_MAX_DEPTH];
+    int depth;
+};
+
+// Double-buffered queue: the signal handler writes to fgSampleQueue[fgActiveBuf],
+// and processFlameGraphQueue swaps buffers so it can drain the old buffer
+// without holding the lock (and without the signal handler overwriting entries
+// mid-drain).
+static StackSample fgSampleBufs[2][FG_QUEUE_SIZE];
+static int fgActiveBuf = 0;   // index of the buffer the signal handler writes to
+static long fgQueuePtr = 0;   // write index within the active buffer
+static PLock fgQueueLock;
+
+// Aggregated folded-stack counts.  Only accessed from the main thread.
+// flamegraphOrder preserves insertion (chronological) order of first occurrence.
+static std::unordered_map<std::string, POLYUNSIGNED> flamegraphCounts;
+static std::vector<std::string> flamegraphOrder;
+
+// Build a folded-stack string from a StackSample (root at left, leaf at right)
+// and increment its count in flamegraphCounts.
+static void accumulateSample(const StackSample& sample)
+{
+    if (sample.depth == 0) return;
+
+    std::string folded;
+    // frames[0] is the leaf (most recent); iterate in reverse for root-first order.
+    for (int j = sample.depth - 1; j >= 0; j--)
+    {
+        PolyObject *obj = sample.frames[j];
+        PolyWord *firstConstant = machineDependent->ConstPtrForCode(obj);
+        PolyWord nameWord = firstConstant[0];
+        if (nameWord == PolyWord::FromUnsigned(0) || !nameWord.IsDataPtr())
+            continue;
+        PolyStringObject *ps = (PolyStringObject*)nameWord.AsObjPtr();
+        if (!folded.empty()) folded += ";";
+        folded.append(ps->chars, ps->length);
+    }
+
+    if (!folded.empty())
+    {
+        if (flamegraphCounts.find(folded) == flamegraphCounts.end())
+            flamegraphOrder.push_back(folded);
+        flamegraphCounts[folded]++;
+    }
+}
+
+// Called from the signal handler / profiling interrupt to queue a stack sample.
+void addFlameGraphSample(TaskData *taskData, SIGNALCONTEXT *context)
+{
+    if (taskData == 0) return;
+    PLocker locker(&fgQueueLock);
+    long q = fgQueuePtr;
+    if (q < FG_QUEUE_SIZE)
+    {
+        StackSample& s = fgSampleBufs[fgActiveBuf][q];
+        s.depth = 0;
+        taskData->GetStackFramesForFlamegraph(context, s.frames, FG_MAX_DEPTH, s.depth);
+        if (s.depth > 0)
+            fgQueuePtr++;
+    }
+}
+
+// Called by the main thread to drain the sample queue into flamegraphCounts.
+void processFlameGraphQueue()
+{
+    // Swap to the other buffer under the lock so the signal handler can continue
+    // writing to the new active buffer while we drain the old one.
+    int drainBuf;
+    long count;
+    {
+        PLocker locker(&fgQueueLock);
+        drainBuf = fgActiveBuf;
+        count = fgQueuePtr;
+        fgActiveBuf = 1 - fgActiveBuf;
+        fgQueuePtr = 0;
+    }
+    for (long i = 0; i < count; i++)
+        accumulateSample(fgSampleBufs[drainBuf][i]);
+}
 
 class ProfileRequest: public MainThreadRequest
 {
@@ -394,7 +488,18 @@ void handleProfileTrap(TaskData *taskData, SIGNALCONTEXT *context)
 
     if (mainThreadPhase == MTP_USER_CODE)
     {
-        if (taskData == 0 || !taskData->AddTimeProfileCount(context))
+        if (profileMode == kProfileFlamegraph)
+        {
+            // Force the ML thread to enter the RTS at its next safe point (function
+            // entry stack-limit check).  The assembly trap prologue saves %rsp into
+            // assemblyInterface.stackPtr before calling the handler, so when
+            // ProcessAsynchRequests runs it can call GetStackFramesForFlamegraph and
+            // get the full live ML stack (including fib frames), not the stale value
+            // that assemblyInterface.stackPtr holds during signal delivery.
+            if (taskData != 0)
+                taskData->InterruptCode();
+        }
+        else if (taskData == 0 || !taskData->AddTimeProfileCount(context))
         {
             PLocker lock(&countLock);
             mainThreadCounts[MTP_USER_CODE]++;
@@ -517,6 +622,111 @@ POLYUNSIGNED PolyProfiling(POLYUNSIGNED threadId, POLYUNSIGNED mode)
     else return result->Word().AsUnsigned();
 }
 
+// FlamegraphRequest: start or stop flamegraph profiling.
+// When stopping (mode == kProfileOff), drains the sample queue and returns
+// the accumulated folded-stack data as an ML list of (count * string) pairs.
+class FlamegraphRequest: public MainThreadRequest
+{
+public:
+    FlamegraphRequest(unsigned prof, TaskData *pTask):
+        MainThreadRequest(MTP_PROFILING), mode(prof), pCallingThread(pTask), errorMessage(0) {}
+    virtual void Perform();
+    Handle extractAsList(TaskData *taskData);
+private:
+    unsigned mode;
+    TaskData *pCallingThread;
+public:
+    const char *errorMessage;
+};
+
+void FlamegraphRequest::Perform()
+{
+    if (mode != kProfileOff && profileMode != kProfileOff)
+    {
+        errorMessage = "Profiling is currently active";
+        return;
+    }
+
+    switch (mode)
+    {
+    case kProfileOff:
+        profileMode = kProfileOff;
+        processes->StopProfiling();
+        processFlameGraphQueue(); // Drain any remaining samples
+        break;
+
+    case kProfileFlamegraph:
+        flamegraphCounts.clear();
+        flamegraphOrder.clear();
+        fgQueuePtr = 0;
+        fgActiveBuf = 0;
+        profileMode = kProfileFlamegraph;
+        processes->StartProfiling();
+        break;
+
+    default:
+        break;
+    }
+}
+
+// Build an ML list of (count * folded_stack_string) pairs from flamegraphCounts,
+// in chronological order (the order stacks were first seen during profiling).
+Handle FlamegraphRequest::extractAsList(TaskData *taskData)
+{
+    Handle saved = taskData->saveVec.mark();
+    Handle list = taskData->saveVec.push(ListNull);
+
+    // Iterate flamegraphOrder in reverse so that prepending gives chronological
+    // order at the head of the list (first sample first).
+    for (int i = (int)flamegraphOrder.size() - 1; i >= 0; i--)
+    {
+        const std::string& key = flamegraphOrder[i];
+        POLYUNSIGNED count = flamegraphCounts.at(key);
+        Handle pair = alloc_and_save(taskData, 2);
+        Handle countValue = Make_arbitrary_precision(taskData, count);
+        Handle nameHandle = taskData->saveVec.push(
+            C_string_to_Poly(taskData, key.c_str()));
+        pair->WordP()->Set(0, countValue->Word());
+        pair->WordP()->Set(1, nameHandle->Word());
+        Handle next = alloc_and_save(taskData, sizeof(ML_Cons_Cell) / sizeof(PolyWord));
+        DEREFLISTHANDLE(next)->h = pair->Word();
+        DEREFLISTHANDLE(next)->t = list->Word();
+
+        taskData->saveVec.reset(saved);
+        list = taskData->saveVec.push(next->Word());
+    }
+
+    return list;
+}
+
+static Handle flamegraphrc(TaskData *taskData, Handle mode_handle)
+{
+    unsigned mode = get_C_unsigned(taskData, mode_handle->Word());
+    FlamegraphRequest request(mode, taskData);
+    processes->MakeRootRequest(taskData, &request);
+    if (request.errorMessage != 0) raise_exception_string(taskData, EXC_Fail, request.errorMessage);
+    return request.extractAsList(taskData);
+}
+
+POLYUNSIGNED PolyFlamegraph(POLYUNSIGNED threadId, POLYUNSIGNED mode)
+{
+    TaskData *taskData = TaskData::FindTaskForId(threadId);
+    ASSERT(taskData != 0);
+    taskData->PreRTSCall();
+    Handle reset = taskData->saveVec.mark();
+    Handle pushedMode = taskData->saveVec.push(mode);
+    Handle result = 0;
+
+    try {
+        result = flamegraphrc(taskData, pushedMode);
+    } catch (...) { }
+
+    taskData->saveVec.reset(reset);
+    taskData->PostRTSCall();
+    if (result == 0) return TAGGED(0).AsUnsigned();
+    else return result->Word().AsUnsigned();
+}
+
 // This is called from the root thread when all the ML threads have been paused.
 void ProfileRequest::Perform()
 {
@@ -579,6 +789,7 @@ struct _entrypts profilingEPT[] =
 {
     // Profiling
     { "PolyProfiling",                  (polyRTSFunction)&PolyProfiling},
+    { "PolyFlamegraph",                 (polyRTSFunction)&PolyFlamegraph},
 
     { NULL, NULL} // End of list.
 };

@@ -2099,6 +2099,39 @@ in
                 end
                 
                 val profileData = profileDataStream printProfile
+
+                (* Flamegraph profiling.
+                   profileFlamegraph runs f arg under the timer-based sampler,
+                   capturing full call stacks.  When done it calls stream with
+                   a list of (count, folded-stack-string) pairs suitable for
+                   piping through flamegraph.pl.
+
+                   Example:
+                     PolyML.Profiling.profileFlamegraph
+                       (fn pairs =>
+                          let val out = TextIO.openOut "out.folded"
+                          in  List.app (fn (n,s) =>
+                                TextIO.output(out, s ^ " " ^ Int.toString n ^ "\n"))
+                                      pairs;
+                              TextIO.closeOut out
+                          end)
+                       f arg
+                *)
+                local
+                    val fgControl : int -> (int * string) list =
+                        RunCall.rtsCallFull1 "PolyFlamegraph"
+                in
+                    fun profileFlamegraph (stream : (int * string) list -> unit) f arg =
+                    let
+                        val _ = fgControl 8 (* kProfileFlamegraph *)
+                        val result =
+                            f arg handle exn =>
+                                (stream (fgControl 0); PolyML.Exception.reraise exn)
+                    in
+                        stream (fgControl 0);
+                        result
+                    end
+                end
             end
         end
 

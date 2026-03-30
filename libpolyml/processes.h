@@ -139,6 +139,12 @@ public:
     // Used to implement PolyML.stackTrace.
     virtual void GetStackTrace(std::vector<PolyObject*>& codeObjects) {}
 
+    // Walk the ML stack from the interrupted context and store up to maxDepth
+    // code object pointers (most recent first) in frames[].  Sets depth to the
+    // number of frames stored.  Used for flamegraph profiling.
+    virtual void GetStackFramesForFlamegraph(SIGNALCONTEXT *context,
+        PolyObject** frames, int maxDepth, int& depth) { depth = 0; }
+
     // Functions called before and after an RTS call.
     virtual void PreRTSCall(void) { saveVec.init(); }
     virtual void PostRTSCall(void) {}

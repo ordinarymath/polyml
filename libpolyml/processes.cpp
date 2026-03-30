@@ -1488,6 +1488,7 @@ void Processes::BeginRootThread(PolyObject *rootFunction)
 
         // Process the profile queue if necessary.
         processProfileQueue();
+        processFlameGraphQueue();
     }
     schedLock.Unlock();
     finish(exitResult); // Close everything down and exit.
@@ -1665,7 +1666,7 @@ bool Processes::ProcessAsynchRequests(TaskData *taskData)
 
 #ifndef HAVE_WINDOWS_H
     // Start the profile timer if needed.
-    if (profileMode == kProfileTime)
+    if (profileMode == kProfileTime || profileMode == kProfileFlamegraph)
     {
         if (! ptaskData->runningProfileTimer)
         {
@@ -1675,6 +1676,12 @@ bool Processes::ProcessAsynchRequests(TaskData *taskData)
     }
     else ptaskData->runningProfileTimer = false;
     // The timer will be stopped next time it goes off.
+
+    // For flamegraph profiling: the signal handler called InterruptCode() to force
+    // us here.  assemblyInterface.stackPtr was saved by the assembly trap prologue
+    // and now reflects the live ML stack, so capture it.
+    if (profileMode == kProfileFlamegraph)
+        addFlameGraphSample(ptaskData, NULL);
 #endif
     return wasInterrupted;
 }
@@ -1745,7 +1752,7 @@ void Processes::RequestProcessExit(int n)
 static void catchVTALRM(SIG_HANDLER_ARGS(sig, context))
 {
     ASSERT(sig == SIGVTALRM);
-    if (profileMode != kProfileTime)
+    if (profileMode != kProfileTime && profileMode != kProfileFlamegraph)
     {
         // We stop the timer for this thread on the next signal after we end profile
         static struct itimerval stoptime = {{0, 0}, {0, 0}};
@@ -1959,10 +1966,10 @@ void Processes::Init(void)
 // On Linux, at least, each thread needs to run this.
 void Processes::StartProfilingTimer(void)
 {
-    // set virtual timer to go off every millisecond
+    // set virtual timer to go off every 200 microseconds (5x more samples than 1ms)
     struct itimerval starttime;
     starttime.it_interval.tv_sec = starttime.it_value.tv_sec = 0;
-    starttime.it_interval.tv_usec = starttime.it_value.tv_usec = 1000;
+    starttime.it_interval.tv_usec = starttime.it_value.tv_usec = 200;
     setitimer(ITIMER_VIRTUAL,&starttime,NULL);
 }
 #endif
