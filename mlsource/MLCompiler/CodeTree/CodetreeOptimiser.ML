@@ -1077,18 +1077,19 @@ struct
                             val () = if List.length newLoopArgs <> finalArgLength then raise InternalError "Bad length 1" else ()
                             val loopBody = Loop newLoopArgs
                         in
-                            SOME(mkEnv(newDecs, loopBody))
+                            (mkEnv(newDecs, loopBody))
                         end
-                    |   replaceLoop(l as Lambda _) = SOME l (* Not inside functions *)
-                    |   replaceLoop(l as BeginLoop _) = SOME l (* And not inside inner loops *)
-                    |   replaceLoop _ = NONE
-                    
+                    |   replaceLoop(Cond(ifpt, thenpt, elsept)) = Cond(ifpt, replaceLoop thenpt, replaceLoop elsept)
+                    |   replaceLoop(Newenv(decs, exp)) = Newenv(decs,replaceLoop exp)
+                    |   replaceLoop(Handle{exp, handler, exPacketAddr}) = Handle{exp=replaceLoop exp, handler=replaceLoop handler, exPacketAddr=exPacketAddr}
+                    |   replaceLoop l = l
+
                     (* Inside the body we have to construct a tuple for the original argument.
                        The simplifier will then replace every use of this with a reference to
                        the new argument. *)
                     val tupleForBody = mkTuple(map(fn a => Extract(LoadLocal a)) tupleAddrs)
                     val newLoop =
-                        mkEnv([Declar{addr=addrForTuple, value=tupleForBody, use=[UseGeneral]}], mapCodetree replaceLoop loop)
+                        mkEnv([Declar{addr=addrForTuple, value=tupleForBody, use=[UseGeneral]}], replaceLoop loop)
 
                     val () = reprocess := true
                     val () = codeTreePrinter(PrettyString "Optimiser: replace loop")
