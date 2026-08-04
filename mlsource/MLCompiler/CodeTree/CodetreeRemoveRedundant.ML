@@ -179,109 +179,207 @@ struct
         
         |   cleanExtract(LoadRecursive, codeUse) = (recursiveRef codeUse; LoadRecursive)
 
+        (* Process a Newenv.  "codeUse" describes how the result value is used; an empty
+           codeUse means the value is not required, in which case the final expression is
+           cleaned for its side-effects only and the whole thing collapses to NONE if
+           nothing survives.  For a required value (non-empty codeUse) the result is always
+           SOME. *)
+        and cleanNewenv((decs, exp), codeUse) =
+            let
+                (* Process the declarations in reverse order.  A binding may be used in a
+                   later declaration but apart from mutually-recursive functions no binding
+                   can be used in an earlier one. *)
+                fun processDecs [] = []
+
+                |   processDecs(Declar{value, addr, ...} :: rest) =
+                    let
+                        val processedRest = processDecs rest
+                    in
+                        (* We can drop bindings that are unused if they have no side-effects.
+                           If we retain the binding we must set at least one reference. *)
+                        case Array.sub(locals, addr) of
+                            [] => (case cleanDead value of
+                                       NONE => processedRest
+                                   |   SOME cleanedvalue => NullBinding cleanedvalue :: processedRest)
+                        |   uses => Declar{value=cleanCode(value, uses), addr=addr, use=uses} :: processedRest
+                    end
+
+                |   processDecs(RecDecs decs :: rest) =
+                    let
+                        val processedRest = processDecs rest
+                        (* We now know the entries that have actually been used
+                           in the rest of the code.  We need to include those
+                           declarations and any that they use.
+                           The result we pass down may well exclude some or all
+                           recursive uses.  We need to include UseGeneral in
+                           the result for safety. *)
+                        fun processMutuals([], excluded, true) =
+                                (* If we have included a function in this
+                                   pass we have to reprocess the list of
+                                   those we excluded before. *)
+                                processMutuals(excluded, [], false)
+                         |  processMutuals([], _, false) =
+                                (* We didn't add anything more - finish *) []
+                         |  processMutuals(
+                                (this as {addr, lambda, ...}) :: rest, excluded, added) =
+                            (
+                                case Array.sub(locals, addr) of
+                                    [] => (* Put this on the excluded list. *)
+                                        processMutuals(rest, this::excluded, added)
+                                |   useSoFar =>
+                                        (* Process this then the rest of the list. *)
+                                        (addr, cleanLambda(lambda, UseGeneral :: useSoFar)) ::
+                                            processMutuals(rest, excluded, true)
+                            )
+                        val entriesUsed = processMutuals(decs, [], false)
+                        (* Get all the uses now we're finished and have identified
+                           all the recursive uses. *)
+                        val processedDecs =
+                            map (fn(a, l) => {addr=a, lambda=l, use=Array.sub(locals, a)}) entriesUsed
+                    in
+                        if null processedDecs
+                        then processedRest
+                        else RecDecs processedDecs :: processedRest
+                    end
+
+                |   processDecs(NullBinding exp :: rest) =
+                    let
+                        val processedRest = processDecs rest
+                    in
+                        case cleanDead exp of
+                            NONE => processedRest
+                        |   SOME cleanedexp => NullBinding cleanedexp :: processedRest
+                    end
+
+                |   processDecs(Container{setter, size, addr, ...} :: rest) =
+                    let
+                        val processedRest = processDecs rest
+                        val decUses =
+                            case Array.sub(locals, addr) of
+                                [] => if sideEffectFree setter then [] else [UseGeneral]
+                            |   uses => uses
+                    in
+                        (* We can drop bindings that are unused if they have no side-effects.
+                           If we retain the binding we must set at least one reference. *)
+                        (* Currently SetContainer is treated as having a side-effect so
+                           we will never discard this even if the container is unused. *)
+                        if null decUses
+                        then processedRest (* Skip it *)
+                        else Container{setter=cleanCode (setter, [UseGeneral]), addr=addr, size=size, use=decUses} :: processedRest
+                    end
+
+                (* Process the expression first so any references it makes are marked,
+                   then the bindings (in reverse order). *)
+                val processedExp =
+                    if null codeUse then cleanDead exp else SOME(cleanCode(exp, codeUse))
+            in
+                case (processDecs decs, processedExp) of
+                    ([], NONE) => NONE
+                |   (decs, expOpt) => SOME(mkEnv(decs, Option.getOpt(expOpt, CodeZero)))
+            end
+
+        (* Clean a list of sub-expressions whose values are not required, keeping their
+           side-effects in evaluation order.  NONE if they are all side-effect-free. *)
+        and cleanDeadList codes =
+            let
+                fun keep [] = []
+                |   keep(c :: rest) =
+                        (case cleanDead c of NONE => keep rest | SOME r => NullBinding r :: keep rest)
+            in
+                case keep codes of
+                    [] => NONE
+                |   binds => SOME(mkEnv(binds, CodeZero))
+            end
+
+        (* Process code whose result value is not required, retaining only what is needed
+           for its side-effects.  Returns NONE if the code is side-effect-free (nothing to
+           keep) or SOME of the residual code. *)
+        and cleanDead(Newenv nenv) = cleanNewenv(nenv, [])
+
+        |   cleanDead(Cond(test, thenpt, elsept)) =
+                (
+                    case (cleanDead thenpt, cleanDead elsept) of
+                        (* Both arms side-effect-free: the branch selection is unobservable
+                           when the result is discarded, so only the test's effects remain. *)
+                        (NONE, NONE) => cleanDead test
+                    |   (t, e) =>
+                            SOME(Cond(cleanCode(test, [UseGeneral]),
+                                      Option.getOpt(t, CodeZero), Option.getOpt(e, CodeZero)))
+                )
+
+            (* Building a tuple has no observable effect, so drop it and keep only the
+               fields' side-effects, in order. *)
+        |   cleanDead(Tuple{fields, ...}) = cleanDeadList fields
+
+        |   cleanDead(Indirect{base, ...}) = cleanDead base (* Indexing is side-effect-free. *)
+
+            (* A discarded handler must be kept even when the handler is pure, because
+               catching and discarding an exception suppresses it.  But if the body cannot
+               raise or have an effect the handler is unreachable and the whole thing dies. *)
+        |   cleanDead(Handle{exp, handler, exPacketAddr}) =
+                (
+                    case cleanDead exp of
+                        NONE => NONE
+                    |   SOME e =>
+                            SOME(Handle{exp=e, handler=Option.getOpt(cleanDead handler, CodeZero),
+                                        exPacketAddr=exPacketAddr})
+                )
+
+            (* Operation nodes.  Decide whether the operator itself has an effect by calling
+               sideEffectFree about a copy with constant operands (O(1), and it tracks
+               codeProps).  If the operator is pure, drop it and keep the operand effects;
+               otherwise keep the whole node. *)
+        |   cleanDead(code as Nullary _) = if sideEffectFree code then NONE else SOME code
+
+        |   cleanDead(code as Unary{oper, arg1}) =
+                if sideEffectFree(Unary{oper=oper, arg1=CodeZero})
+                then cleanDead arg1
+                else SOME(cleanCode(code, [UseGeneral]))
+
+        |   cleanDead(code as Binary{oper, arg1, arg2}) =
+                if sideEffectFree(Binary{oper=oper, arg1=CodeZero, arg2=CodeZero})
+                then cleanDeadList[arg1, arg2]
+                else SOME(cleanCode(code, [UseGeneral]))
+
+            (* A tag test, a load (immutable or mutable) and an allocation all have no
+               effect of their own, so keep only their operand effects. *)
+        |   cleanDead(TagTest{test, ...}) = cleanDead test
+
+        |   cleanDead(LoadOperation{address={base, index, ...}, ...}) =
+                cleanDeadList(base :: (case index of SOME i => [i] | NONE => []))
+
+        |   cleanDead(AllocateWordMemory{numWords, flags, initial}) =
+                cleanDeadList[numWords, flags, initial]
+
+            (* A block move is a store (keep); byte equality/compare is applicative. *)
+        |   cleanDead(code as BlockOperation{kind, sourceLeft, destRight, length}) =
+                (
+                    case kind of
+                        BlockOpMove _ => SOME(cleanCode(code, [UseGeneral]))
+                    |   _ =>
+                        let
+                            fun addrParts{base, index, ...} =
+                                base :: (case index of SOME i => [i] | NONE => [])
+                        in
+                            cleanDeadList(addrParts sourceLeft @ addrParts destRight @ [length])
+                        end
+                )
+
+            (* Arbitrary precision: the compiler treats its operands as just [arg1, arg2]
+               (see evaluateInlining); shortCond and longCall are pure functions of them. *)
+        |   cleanDead(Arbitrary{arg1, arg2, ...}) = cleanDeadList[arg1, arg2]
+
+        |   cleanDead(Extract _) = NONE
+        |   cleanDead(Constnt _) = NONE
+        |   cleanDead(Lambda _) = NONE
+
+            (* Everything else — Eval, Raise, BeginLoop, Loop, StoreOperation, SetContainer
+               — always carries a side-effect, so keep it with the result discarded. *)
+        |   cleanDead code = SOME(cleanCode(code, [UseGeneral]))
+
         and cleanCode (code, codeUse) =
         let
-            fun doClean codeUse (Newenv(decs, exp)) =
-                let
-                    (* First process the expression so as to mark any references it makes. *)
-                    val processedExp = cleanCode (exp, codeUse)
-                
-                    (* Process the declarations in reverse order.  A binding may be used in
-                       a later declaration but apart from mutually-recursive functions no binding
-                       can be used in an earlier one. *)
-                    fun processDecs [] = []
-
-                    |   processDecs(Declar{value, addr, ...} :: rest) =
-                        let
-                            val processedRest = processDecs rest
-                            val decUses =
-                                case Array.sub(locals, addr) of
-                                    [] => if sideEffectFree value then [] else [UseGeneral]
-                                |   uses => uses
-                        in
-                            (* We can drop bindings that are unused if they have no side-effects.
-                               If we retain the binding we must set at least one reference. *)
-                            if null decUses
-                            then processedRest (* Skip it *)
-                            else
-                            let
-                                val cleanvalue =
-                                    case value of
-                                        Lambda lambda => Lambda(cleanLambda(lambda, decUses))
-                                    |   value => cleanCode (value, decUses)
-                            in
-                                Declar{value=cleanvalue, addr=addr, use=decUses} :: processedRest
-                            end
-                        end
-
-                    |   processDecs(RecDecs decs :: rest) =
-                        let
-                            val processedRest = processDecs rest
-                            (* We now know the entries that have actually been used
-                               in the rest of the code.  We need to include those
-                               declarations and any that they use.
-                               The result we pass down may well exclude some or all
-                               recursive uses.  We need to include UseGeneral in
-                               the result for safety. *)
-                            fun processMutuals([], excluded, true) =
-                                    (* If we have included a function in this
-                                       pass we have to reprocess the list of
-                                       those we excluded before. *)
-                                    processMutuals(excluded, [], false)
-                             |  processMutuals([], _, false) =
-                                    (* We didn't add anything more - finish *) []
-                             |  processMutuals(
-                                    (this as {addr, lambda, ...}) :: rest, excluded, added) =
-                                (
-                                    case Array.sub(locals, addr) of
-                                        [] => (* Put this on the excluded list. *)
-                                            processMutuals(rest, this::excluded, added)
-                                    |   useSoFar =>
-                                            (* Process this then the rest of the list. *)
-                                            (addr, cleanLambda(lambda, UseGeneral :: useSoFar)) ::
-                                                processMutuals(rest, excluded, true)
-                                )
-                            val entriesUsed = processMutuals(decs, [], false)
-                            (* Get all the uses now we're finished and have identified
-                               all the recursive uses. *)
-                            val processedDecs =
-                                map (fn(a, l) => {addr=a, lambda=l, use=Array.sub(locals, a)}) entriesUsed
-                        in
-                            if null processedDecs
-                            then processedRest
-                            else RecDecs processedDecs :: processedRest
-                        end
-
-                    |   processDecs(NullBinding exp :: rest) =
-                        let
-                            val processedRest = processDecs rest
-                        in
-                            if sideEffectFree exp
-                            then processedRest
-                            else NullBinding(cleanCode(exp, [UseGeneral])) :: processedRest
-                        end
-
-                    |   processDecs(Container{setter, size, addr, ...} :: rest) =
-                        let
-                            val processedRest = processDecs rest
-                            val decUses =
-                                case Array.sub(locals, addr) of
-                                    [] => if sideEffectFree setter then [] else [UseGeneral]
-                                |   uses => uses
-                        in
-                            (* We can drop bindings that are unused if they have no side-effects.
-                               If we retain the binding we must set at least one reference. *)
-                            (* Currently SetContainer is treated as having a side-effect so
-                               we will never discard this even if the container is unused. *)
-                            if null decUses
-                            then processedRest (* Skip it *)
-                            else Container{setter=cleanCode (setter, [UseGeneral]), addr=addr, size=size, use=decUses} :: processedRest
-                        end
-
-                    val processedDecs = processDecs decs
-                in
-                    SOME(mkEnv(processedDecs, processedExp))
-                end (* Newenv *)
+            fun doClean codeUse (Newenv nenv) = SOME(Option.getOpt(cleanNewenv(nenv, codeUse), CodeZero))
 
                 (* Reference to a binding. *)
             |   doClean codeUse (Extract ext) = SOME(Extract(cleanExtract(ext, codeUse)))
@@ -308,12 +406,7 @@ struct
                     |   fieldUse _ (use, tl) = use :: tl
 
                     fun fieldUses n =
-                        (* For the moment, if we find that the field is not used we set the
-                           usage to UseGeneral.  I'm not convinced it would be safe to
-                           discard anything in the expression at this point. *)
-                        case List.foldl(fieldUse n) [] codeUse of
-                            [] => [UseGeneral]
-                        |   other => other
+                        List.foldl(fieldUse n) [] codeUse
                             
                     fun processField([], _) = []
                     |   processField(hd::tl, n) =
@@ -398,9 +491,12 @@ struct
         in
             (* If we recognise this as a special case we use the result otherwise
                we process it as a general value using UseGeneral as the usage. *)
-            case doClean codeUse code of
+            if null codeUse
+            then Option.getOpt(cleanDead code,CodeZero)
+            else
+            (case doClean codeUse code of
                 SOME result => result
-            |   NONE => mapCodetree (doClean [UseGeneral]) code
+            |   NONE => mapCodetree (doClean [UseGeneral]) code)
         end
 
     in
