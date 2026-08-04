@@ -291,6 +291,62 @@ struct
                 |   binds => SOME(mkEnv(binds, CodeZero))
             end
 
+        (* Process a BeginLoop.  "codeUse" is how the loop's result value is used, which is
+           the usage of every exit branch (a tail-position expression that is not a Loop).
+           When the result is unused (codeUse = []) those branches are cleaned dead, while
+           the Loop jumps that continue iteration are kept. *)
+        and cleanBeginLoop((loop, arguments), codeUse) =
+            let
+                val cleanBody = cleanCode(loop, codeUse)
+                (* Remove unused arguments.  They're unnecessary and may cause problems
+                   later on. *)
+                fun filterUnused [] = ([], [])
+                |   filterUnused(({value, addr, ...}, t) :: args) =
+                    let
+                        val (used, discards) = filterUnused args
+                    in
+                        case Array.sub(locals, addr) of
+                            [] => (* We only need to keep this if it might have a side-effect. *)
+                                (used, NullBinding(cleanCode(value, [UseGeneral])) :: discards)
+                        |   use => (({value=cleanCode(value, use), addr=addr, use=use}, t) :: used, discards)
+                    end
+                val (usedArgs, discards) = filterUnused arguments
+            in
+                if not(null discards)
+                then
+                let
+                    fun splitArgs([], []) = ([], [])
+                    |   splitArgs((arg as (argVal, _)) :: args, ({addr, ...}, _) :: arguments) =
+                        let
+                            val (useArgs, discards) = splitArgs(args, arguments)
+                        in
+                            (* We actually only need to keep this argument if it might have
+                               a side-effect but keep it anyway. *)
+                            case Array.sub(locals, addr) of
+                                [] => (useArgs, NullBinding argVal :: discards)
+                            |   _ => (arg :: useArgs, discards)
+                        end
+                    |   splitArgs _ = raise InternalError "splitArgs"
+
+                    fun filterLoopArgs(Loop l) =
+                        let
+                            val (useArgs, discards) = splitArgs(l, arguments)
+                        in
+                            SOME(Newenv(discards, Loop useArgs))
+                        end
+                        (* Don't descend into functions or inner loops. *)
+                    |   filterLoopArgs(instr as Lambda _) = SOME instr
+                    |   filterLoopArgs(instr as BeginLoop _) = SOME instr
+                    |   filterLoopArgs _ = NONE
+
+                    val newLoop =
+                        BeginLoop {loop = mapCodetree filterLoopArgs cleanBody, arguments = usedArgs}
+                in
+                    Newenv(discards, newLoop)
+                end
+                else BeginLoop {loop = cleanBody, arguments = usedArgs}
+            end
+
         (* Process code whose result value is not required, retaining only what is needed
            for its side-effects.  Returns NONE if the code is side-effect-free (nothing to
            keep) or SOME of the residual code. *)
@@ -369,12 +425,17 @@ struct
                (see evaluateInlining); shortCond and longCall are pure functions of them. *)
         |   cleanDead(Arbitrary{arg1, arg2, ...}) = cleanDeadList[arg1, arg2]
 
+            (* Keep the loop, but clean its body dead: every exit branch (a tail-position
+               expression that is not a Loop) has its now-unused result discarded, and any
+               loop argument that only fed such a branch is dropped. *)
+        |   cleanDead(BeginLoop{loop, arguments}) = SOME(cleanBeginLoop((loop, arguments), []))
+
         |   cleanDead(Extract _) = NONE
         |   cleanDead(Constnt _) = NONE
         |   cleanDead(Lambda _) = NONE
 
-            (* Everything else — Eval, Raise, BeginLoop, Loop, StoreOperation, SetContainer
-               — always carries a side-effect, so keep it with the result discarded. *)
+            (* Everything else — Eval, Raise, Loop, StoreOperation, SetContainer — always
+               carries a side-effect, so keep it with the result discarded. *)
         |   cleanDead code = SOME(cleanCode(code, [UseGeneral]))
 
         and cleanCode (code, codeUse) =
@@ -434,58 +495,8 @@ struct
             |   doClean codeUse (Cond(i, t, e)) =
                     SOME(Cond(cleanCode(i, [UseGeneral]), cleanCode(t, codeUse), cleanCode(e, codeUse)))
 
-            |   doClean use (BeginLoop{loop, arguments}) =
-                let
-                    val cleanBody = cleanCode(loop, use)
-                    (* Remove unused arguments.  They're unnecessary and may cause problems
-                       later on. *)
-                    fun filterUnused [] = ([], [])
-                    |   filterUnused(({value, addr, ...}, t) :: args) =
-                        let
-                            val (used, discards) = filterUnused args
-                        in
-                            case Array.sub(locals, addr) of
-                                [] => (* We only need to keep this if it might have a side-effect. *)
-                                    (used, NullBinding(cleanCode(value, [UseGeneral])) :: discards)
-                            |   use => (({value=cleanCode(value, use), addr=addr, use=use}, t) :: used, discards)
-                        end
-                    val (usedArgs, discards) = filterUnused arguments
-                in
-                    if not(null discards)
-                    then
-                    let
-                        fun splitArgs([], []) = ([], [])
-                        |   splitArgs((arg as (argVal, _)) :: args, ({addr, ...}, _) :: arguments) =
-                            let
-                                val (useArgs, discards) = splitArgs(args, arguments)
-                            in
-                                (* We actually only need to keep this argument if it might have
-                                   a side-effect but keep it anyway. *)
-                                case Array.sub(locals, addr) of
-                                    [] => (useArgs, NullBinding argVal :: discards)
-                                |   _ => (arg :: useArgs, discards)
-                            end
-                        |   splitArgs _ = raise InternalError "splitArgs"
+            |   doClean use (BeginLoop{loop, arguments}) = SOME(cleanBeginLoop((loop, arguments), use))
 
-                        fun filterLoopArgs(Loop l) =
-                            let
-                                val (useArgs, discards) = splitArgs(l, arguments)
-                            in
-                                SOME(Newenv(discards, Loop useArgs))
-                            end
-                            (* Don't descend into functions or inner loops. *)
-                        |   filterLoopArgs(instr as Lambda _) = SOME instr
-                        |   filterLoopArgs(instr as BeginLoop _) = SOME instr
-                        |   filterLoopArgs _ = NONE
-
-                        val newLoop =
-                            BeginLoop {loop = mapCodetree filterLoopArgs cleanBody, arguments = usedArgs}
-                    in
-                        SOME(Newenv(discards, newLoop))
-                    end
-                    else SOME(BeginLoop {loop = cleanBody, arguments = usedArgs})
-                end
-        
             |   doClean _ _ = NONE (* Anything else *)
             
         in
