@@ -118,14 +118,17 @@ struct
                single level case had a bug.  See Test191.ML. *)
             val recursiveResults = resultOfApps recursiveApps
             
-            datatype canonical = CExp | CGen | CApp of canonical | CFields of (int * canonical) list
-            
+            (* CBottom is the "no/empty usage" element *)
+            datatype canonical = CBottom | CExp | CGen | CApp of canonical | CFields of (int * canonical) list
+
             fun tocanon UseExport = CExp
             |   tocanon UseGeneral = CGen
             |   tocanon (UseApply(apps, _)) = CApp(tocanonical apps)
             |   tocanon (UseField(i, uses)) = CFields[(i, tocanonical uses)]
 
-            and mergecanon(CExp, _) = CExp
+            and mergecanon(CBottom, y) = y
+            |   mergecanon(x, CBottom) = x
+            |   mergecanon(CExp, _) = CExp
             |   mergecanon(_, CExp) = CExp
             |   mergecanon(CGen, _) = CGen
             |   mergecanon(_, CGen) = CGen
@@ -140,7 +143,7 @@ struct
             |   mergefield([], l) = l
             |   mergefield(l, []) = l
             
-            and tocanonical [] = CGen
+            and tocanonical [] = CBottom
             |   tocanonical (hd::tl) = List.foldl (fn (a, b) => mergecanon(tocanon a, b)) (tocanon hd) tl
 
         in
@@ -347,6 +350,18 @@ struct
                 else BeginLoop {loop = cleanBody, arguments = usedArgs}
             end
 
+        (* Clean an Eval.  Pass the usage down to the function so that if it is a
+           variable it is marked as "called"; resultUse is how the call's result is
+           used ([] when it is discarded). *)
+        and cleanEval({function, argList, resultType}, resultUse) =
+            let
+                val args = map (fn (c, t) => (cleanCode(c, [UseGeneral]), t)) argList
+                val argTuples = map #1 args
+            in
+                Eval{function = cleanCode(function, [UseApply(resultUse, argTuples)]),
+                     argList = args, resultType = resultType}
+            end
+
         (* Process code whose result value is not required, retaining only what is needed
            for its side-effects.  Returns NONE if the code is side-effect-free (nothing to
            keep) or SOME of the residual code. *)
@@ -430,12 +445,18 @@ struct
                loop argument that only fed such a branch is dropped. *)
         |   cleanDead(BeginLoop{loop, arguments}) = SOME(cleanBeginLoop((loop, arguments), []))
 
+            (* Keep the call (it has an effect), but tell the function its result is
+               unused: mark it UseApply with an empty result usage.  A function whose
+               call sites discard the result then has bodyUse = [] in cleanLambda and
+               so has its body dead-cleaned. *)
+        |   cleanDead(Eval eval) = SOME(cleanEval(eval, []))
+
         |   cleanDead(Extract _) = NONE
         |   cleanDead(Constnt _) = NONE
         |   cleanDead(Lambda _) = NONE
 
-            (* Everything else — Eval, Raise, Loop, StoreOperation, SetContainer — always
-               carries a side-effect, so keep it with the result discarded. *)
+            (* Everything else — Raise, Loop, StoreOperation, SetContainer — always carries
+               a side-effect, so keep it with the result discarded. *)
         |   cleanDead code = SOME(cleanCode(code, [UseGeneral]))
 
         and cleanCode (code, codeUse) =
@@ -478,19 +499,7 @@ struct
 
             |   doClean codeUse (Lambda lam) = SOME(Lambda(cleanLambda(lam, codeUse)))
 
-            |   doClean codeUse (Eval{function, argList, resultType}) =
-                (* As with Indirect we try to pass this information down so that if
-                   the function is a variable it will be marked as "called". *)
-                let
-                    val args = map (fn (c, t) => (cleanCode(c, [UseGeneral]), t)) argList
-                    val argTuples = map #1 args
-                in
-                    SOME(
-                        Eval{
-                            function=cleanCode(function, [UseApply(codeUse, argTuples)]),
-                            argList=args, resultType = resultType
-                        })
-                end
+            |   doClean codeUse (Eval eval) = SOME(cleanEval(eval, codeUse))
 
             |   doClean codeUse (Cond(i, t, e)) =
                     SOME(Cond(cleanCode(i, [UseGeneral]), cleanCode(t, codeUse), cleanCode(e, codeUse)))
