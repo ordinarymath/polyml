@@ -4,12 +4,12 @@
     This library is free software; you can redistribute it and/or
     modify it under the terms of the GNU Lesser General Public
     License version 2.1 as published by the Free Software Foundation.
-    
+
     This library is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
     Lesser General Public License for more details.
-    
+
     You should have received a copy of the GNU Lesser General Public
     License along with this library; if not, write to the Free Software
     Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
@@ -33,11 +33,15 @@ struct
     open CodetreeFunctions
     exception InternalError = Misc.InternalError
 
-    (* This function annotates the tree with information about how variables are used.  This assists
-       the optimiser to choose the best alternative for code.  It also discards bindings that
-       are unused and side-effect-free.  These can arise as the result of optimiser constructing
-       bindings in case they are required.  That was originally its only function; hence the name. *)
-    fun cleanProc (pt, procUses: codeUse list, prev: int * codeUse list -> loadForm, recursiveRef: codeUse list -> unit, localCount, checkArg) =
+    type cleanContext =
+    {
+        locals:       codeUse list array,
+        prev:         int * codeUse list -> loadForm,
+        recursiveRef: codeUse list -> unit,
+        checkArg:     int * codeUse list -> unit
+    }
+
+    fun cleanProc (code, prev, localCount) =
     let
         (* Filter the use information so there is only a single instance of each kind of
            usage.  The usage lists can blow up.  See #197. *)
@@ -62,11 +66,13 @@ struct
         in
             List.app addUse uses
         end
-        
-        val locals = Array.array(localCount, [])
-        val addLocalUse: int -> codeUse list -> unit = addUsesToArray locals
 
-        fun cleanLambda(lambda as {body, isInline, name, argTypes, resultType, localCount, closure, ...}: lambdaForm,
+        (* This function annotates the tree with information about how variables are used.  This assists
+           the optimiser to choose the best alternative for code.  It also discards bindings that
+           are unused and side-effect-free.  These can arise as the result of optimiser constructing
+           bindings in case they are required.  That was originally its only function; hence the name. *)
+        fun cleanLambda(context: cleanContext,
+                        lambda as {body, isInline, name, argTypes, resultType, localCount, closure, ...}: lambdaForm,
                         lambdaUse) =
         let
             (* Rebuild the closure with the entries actually used. *)
@@ -78,7 +84,7 @@ struct
                     val ext = List.nth(closure, closureEntry)
                     (* Process the closure entry.  We need to do this to record the
                        usage information even if we have already seen this entry. *)
-                    val copied = cleanExtract(ext, clUse)
+                    val copied = cleanExtract(context, ext, clUse)
                 in
                     addToClosure closureUse copied
                 end
@@ -86,14 +92,14 @@ struct
             (* This array records the way the arguments are used inside the function. *)
             val argUses = Array.array (List.length argTypes, [])
             fun checkArg(addr, uses) = Array.update(argUses, addr, uses @ Array.sub(argUses, addr))
-            
+
             val recursiveRefRef = ref []
             fun addRef use = recursiveRefRef := use @ !recursiveRefRef
 
             val resultOfApps =
                 List.foldl
                     (fn (UseApply(l, _), r) => l @ r | (UseExport, r) => UseExport :: r | (_, r) => UseGeneral :: r) []
-            
+
             fun filter(true, true, []) = [UseExport, UseGeneral]
             |   filter(false, true, []) = [UseGeneral]
             |   filter(true, false, []) = [UseExport]
@@ -101,10 +107,14 @@ struct
             |   filter(_, isGen, UseExport :: l) = filter(true, isGen, l)
             |   filter(isExp, _, UseGeneral :: l) = filter(isExp, true, l)
             |   filter(isExp, isGen, a (* UseApply, UseField *) :: l) = a :: filter(isExp, isGen, l)
-            
+
             val bodyUse = filter(false, false, resultOfApps lambdaUse)
 
-            val bodyCode = cleanProc(body, bodyUse, lookup, addRef, localCount, checkArg)
+            val bodyContext =
+                { locals = Array.array(localCount, []), prev = lookup, recursiveRef = addRef,
+                  checkArg = checkArg } : cleanContext
+
+            val bodyCode = cleanCode(bodyContext, body, bodyUse)
             val recursiveApps = !recursiveRefRef
             (* If we have called this function somewhere and used the result that gives us a hint on the
                preferred result.  If the function is recursive, though, we can't assume anything
@@ -113,11 +123,11 @@ struct
                That in turn affects any functions whose results are used.  See Test138.ML.
                So, we check to see whether the result of recursive use has added anything to the
                original usage and reprocess the body if it has.
-               
+
                This has been extended to a general recursive case since the original
                single level case had a bug.  See Test191.ML. *)
             val recursiveResults = resultOfApps recursiveApps
-            
+
             (* CBottom is the "no/empty usage" element *)
             datatype canonical = CBottom | CExp | CGen | CApp of canonical | CFields of (int * canonical) list
 
@@ -142,14 +152,14 @@ struct
                 else (i1, mergecanon(u1, u2)) :: mergefield(tl1, tl2)
             |   mergefield([], l) = l
             |   mergefield(l, []) = l
-            
+
             and tocanonical [] = CBottom
             |   tocanonical (hd::tl) = List.foldl (fn (a, b) => mergecanon(tocanon a, b)) (tocanon hd) tl
 
         in
             if not (null recursiveResults) (* short cut *)
                 andalso tocanonical bodyUse <> tocanonical(recursiveResults @ bodyUse)
-            then cleanLambda(lambda, lambdaUse @ recursiveApps)
+            then cleanLambda(context, lambda, lambdaUse @ recursiveApps)
             else
                 let
                     val newClosure = extractClosure closureUse
@@ -164,30 +174,30 @@ struct
 
         (* Process a load from a variable.  Locals and arguments operate on the relevant array,
            closure entries involve a look-up *)
-        and cleanExtract(ext as LoadLocal addr, codeUse) =
+        and cleanExtract(context: cleanContext, ext as LoadLocal addr, codeUse) =
             (
                 (* Check we're actually adding to the usage. *)
                 null codeUse andalso raise InternalError "cleanExtract: empty usage";
-                addLocalUse addr codeUse;
+                addUsesToArray (#locals context) addr codeUse;
                 ext
             )
 
-        |   cleanExtract(ext as LoadArgument addr, codeUse) =
+        |   cleanExtract(context, ext as LoadArgument addr, codeUse) =
             (
-                checkArg(addr, codeUse);
+                #checkArg context (addr, codeUse);
                 ext
             )
 
-        |   cleanExtract(LoadClosure addr, codeUse) = prev(addr, codeUse)
-        
-        |   cleanExtract(LoadRecursive, codeUse) = (recursiveRef codeUse; LoadRecursive)
+        |   cleanExtract(context, LoadClosure addr, codeUse) = #prev context (addr, codeUse)
+
+        |   cleanExtract(context, LoadRecursive, codeUse) = (#recursiveRef context codeUse; LoadRecursive)
 
         (* Process a Newenv.  "codeUse" describes how the result value is used; an empty
            codeUse means the value is not required, in which case the final expression is
            cleaned for its side-effects only and the whole thing collapses to NONE if
            nothing survives.  For a required value (non-empty codeUse) the result is always
            SOME. *)
-        and cleanNewenv((decs, exp), codeUse) =
+        and cleanNewenv(context: cleanContext, (decs, exp), codeUse) =
             let
                 (* Process the declarations in reverse order.  A binding may be used in a
                    later declaration but apart from mutually-recursive functions no binding
@@ -200,11 +210,11 @@ struct
                     in
                         (* We can drop bindings that are unused if they have no side-effects.
                            If we retain the binding we must set at least one reference. *)
-                        case Array.sub(locals, addr) of
-                            [] => (case cleanDead value of
+                        case Array.sub(#locals context, addr) of
+                            [] => (case cleanDead(context, value) of
                                        NONE => processedRest
                                    |   SOME cleanedvalue => NullBinding cleanedvalue :: processedRest)
-                        |   uses => Declar{value=cleanCode(value, uses), addr=addr, use=uses} :: processedRest
+                        |   uses => Declar{value=cleanCode(context, value, uses), addr=addr, use=uses} :: processedRest
                     end
 
                 |   processDecs(RecDecs decs :: rest) =
@@ -226,19 +236,19 @@ struct
                          |  processMutuals(
                                 (this as {addr, lambda, ...}) :: rest, excluded, added) =
                             (
-                                case Array.sub(locals, addr) of
+                                case Array.sub(#locals context, addr) of
                                     [] => (* Put this on the excluded list. *)
                                         processMutuals(rest, this::excluded, added)
                                 |   useSoFar =>
                                         (* Process this then the rest of the list. *)
-                                        (addr, cleanLambda(lambda, UseGeneral :: useSoFar)) ::
+                                        (addr, cleanLambda(context, lambda, UseGeneral :: useSoFar)) ::
                                             processMutuals(rest, excluded, true)
                             )
                         val entriesUsed = processMutuals(decs, [], false)
                         (* Get all the uses now we're finished and have identified
                            all the recursive uses. *)
                         val processedDecs =
-                            map (fn(a, l) => {addr=a, lambda=l, use=Array.sub(locals, a)}) entriesUsed
+                            map (fn(a, l) => {addr=a, lambda=l, use=Array.sub(#locals context, a)}) entriesUsed
                     in
                         if null processedDecs
                         then processedRest
@@ -249,7 +259,7 @@ struct
                     let
                         val processedRest = processDecs rest
                     in
-                        case cleanDead exp of
+                        case cleanDead(context, exp) of
                             NONE => processedRest
                         |   SOME cleanedexp => NullBinding cleanedexp :: processedRest
                     end
@@ -258,7 +268,7 @@ struct
                     let
                         val processedRest = processDecs rest
                         val decUses =
-                            case Array.sub(locals, addr) of
+                            case Array.sub(#locals context, addr) of
                                 [] => if sideEffectFree setter then [] else [UseGeneral]
                             |   uses => uses
                     in
@@ -268,13 +278,13 @@ struct
                            we will never discard this even if the container is unused. *)
                         if null decUses
                         then processedRest (* Skip it *)
-                        else Container{setter=cleanCode (setter, [UseGeneral]), addr=addr, size=size, use=decUses} :: processedRest
+                        else Container{setter=cleanCode(context, setter, [UseGeneral]), addr=addr, size=size, use=decUses} :: processedRest
                     end
 
                 (* Process the expression first so any references it makes are marked,
                    then the bindings (in reverse order). *)
                 val processedExp =
-                    if null codeUse then cleanDead exp else SOME(cleanCode(exp, codeUse))
+                    if null codeUse then cleanDead(context, exp) else SOME(cleanCode(context, exp, codeUse))
             in
                 case (processDecs decs, processedExp) of
                     ([], NONE) => NONE
@@ -283,11 +293,11 @@ struct
 
         (* Clean a list of sub-expressions whose values are not required, keeping their
            side-effects in evaluation order.  NONE if they are all side-effect-free. *)
-        and cleanDeadList codes =
+        and cleanDeadList(context: cleanContext, codes) =
             let
                 fun keep [] = []
                 |   keep(c :: rest) =
-                        (case cleanDead c of NONE => keep rest | SOME r => NullBinding r :: keep rest)
+                        (case cleanDead(context, c) of NONE => keep rest | SOME r => NullBinding r :: keep rest)
             in
                 case keep codes of
                     [] => NONE
@@ -298,9 +308,9 @@ struct
            the usage of every exit branch (a tail-position expression that is not a Loop).
            When the result is unused (codeUse = []) those branches are cleaned dead, while
            the Loop jumps that continue iteration are kept. *)
-        and cleanBeginLoop((loop, arguments), codeUse) =
+        and cleanBeginLoop(context: cleanContext, (loop, arguments), codeUse) =
             let
-                val cleanBody = cleanCode(loop, codeUse)
+                val cleanBody = cleanCode(context, loop, codeUse)
                 (* Remove unused arguments.  They're unnecessary and may cause problems
                    later on. *)
                 fun filterUnused [] = ([], [])
@@ -308,10 +318,10 @@ struct
                     let
                         val (used, discards) = filterUnused args
                     in
-                        case Array.sub(locals, addr) of
+                        case Array.sub(#locals context, addr) of
                             [] => (* We only need to keep this if it might have a side-effect. *)
-                                (used, NullBinding(cleanCode(value, [UseGeneral])) :: discards)
-                        |   use => (({value=cleanCode(value, use), addr=addr, use=use}, t) :: used, discards)
+                                (used, NullBinding(cleanCode(context, value, [UseGeneral])) :: discards)
+                        |   use => (({value=cleanCode(context, value, use), addr=addr, use=use}, t) :: used, discards)
                     end
                 val (usedArgs, discards) = filterUnused arguments
             in
@@ -325,7 +335,7 @@ struct
                         in
                             (* We actually only need to keep this argument if it might have
                                a side-effect but keep it anyway. *)
-                            case Array.sub(locals, addr) of
+                            case Array.sub(#locals context, addr) of
                                 [] => (useArgs, NullBinding argVal :: discards)
                             |   _ => (arg :: useArgs, discards)
                         end
@@ -353,46 +363,46 @@ struct
         (* Clean an Eval.  Pass the usage down to the function so that if it is a
            variable it is marked as "called"; resultUse is how the call's result is
            used ([] when it is discarded). *)
-        and cleanEval({function, argList, resultType}, resultUse) =
+        and cleanEval(context, {function, argList, resultType}, resultUse) =
             let
-                val args = map (fn (c, t) => (cleanCode(c, [UseGeneral]), t)) argList
+                val args = map (fn (c, t) => (cleanCode(context, c, [UseGeneral]), t)) argList
                 val argTuples = map #1 args
             in
-                Eval{function = cleanCode(function, [UseApply(resultUse, argTuples)]),
+                Eval{function = cleanCode(context, function, [UseApply(resultUse, argTuples)]),
                      argList = args, resultType = resultType}
             end
 
         (* Process code whose result value is not required, retaining only what is needed
            for its side-effects.  Returns NONE if the code is side-effect-free (nothing to
            keep) or SOME of the residual code. *)
-        and cleanDead(Newenv nenv) = cleanNewenv(nenv, [])
+        and cleanDead(context: cleanContext, Newenv nenv) = cleanNewenv(context, nenv, [])
 
-        |   cleanDead(Cond(test, thenpt, elsept)) =
+        |   cleanDead(context, Cond(test, thenpt, elsept)) =
                 (
-                    case (cleanDead thenpt, cleanDead elsept) of
+                    case (cleanDead(context, thenpt), cleanDead(context, elsept)) of
                         (* Both arms side-effect-free: the branch selection is unobservable
                            when the result is discarded, so only the test's effects remain. *)
-                        (NONE, NONE) => cleanDead test
+                        (NONE, NONE) => cleanDead(context, test)
                     |   (t, e) =>
-                            SOME(Cond(cleanCode(test, [UseGeneral]),
+                            SOME(Cond(cleanCode(context, test, [UseGeneral]),
                                       Option.getOpt(t, CodeZero), Option.getOpt(e, CodeZero)))
                 )
 
             (* Building a tuple has no observable effect, so drop it and keep only the
                fields' side-effects, in order. *)
-        |   cleanDead(Tuple{fields, ...}) = cleanDeadList fields
+        |   cleanDead(context, Tuple{fields, ...}) = cleanDeadList(context, fields)
 
-        |   cleanDead(Indirect{base, ...}) = cleanDead base (* Indexing is side-effect-free. *)
+        |   cleanDead(context, Indirect{base, ...}) = cleanDead(context, base) (* Indexing is side-effect-free. *)
 
             (* A discarded handler must be kept even when the handler is pure, because
                catching and discarding an exception suppresses it.  But if the body cannot
                raise or have an effect the handler is unreachable and the whole thing dies. *)
-        |   cleanDead(Handle{exp, handler, exPacketAddr}) =
+        |   cleanDead(context, Handle{exp, handler, exPacketAddr}) =
                 (
-                    case cleanDead exp of
+                    case cleanDead(context, exp) of
                         NONE => NONE
                     |   SOME e =>
-                            SOME(Handle{exp=e, handler=Option.getOpt(cleanDead handler, CodeZero),
+                            SOME(Handle{exp=e, handler=Option.getOpt(cleanDead(context, handler), CodeZero),
                                         exPacketAddr=exPacketAddr})
                 )
 
@@ -400,71 +410,71 @@ struct
                sideEffectFree about a copy with constant operands (O(1), and it tracks
                codeProps).  If the operator is pure, drop it and keep the operand effects;
                otherwise keep the whole node. *)
-        |   cleanDead(code as Nullary _) = if sideEffectFree code then NONE else SOME code
+        |   cleanDead(_, code as Nullary _) = if sideEffectFree code then NONE else SOME code
 
-        |   cleanDead(code as Unary{oper, arg1}) =
+        |   cleanDead(context, code as Unary{oper, arg1}) =
                 if sideEffectFree(Unary{oper=oper, arg1=CodeZero})
-                then cleanDead arg1
-                else SOME(cleanCode(code, [UseGeneral]))
+                then cleanDead(context, arg1)
+                else SOME(cleanCode(context, code, [UseGeneral]))
 
-        |   cleanDead(code as Binary{oper, arg1, arg2}) =
+        |   cleanDead(context, code as Binary{oper, arg1, arg2}) =
                 if sideEffectFree(Binary{oper=oper, arg1=CodeZero, arg2=CodeZero})
-                then cleanDeadList[arg1, arg2]
-                else SOME(cleanCode(code, [UseGeneral]))
+                then cleanDeadList(context, [arg1, arg2])
+                else SOME(cleanCode(context, code, [UseGeneral]))
 
             (* A tag test, a load (immutable or mutable) and an allocation all have no
                effect of their own, so keep only their operand effects. *)
-        |   cleanDead(TagTest{test, ...}) = cleanDead test
+        |   cleanDead(context, TagTest{test, ...}) = cleanDead(context, test)
 
-        |   cleanDead(LoadOperation{address={base, index, ...}, ...}) =
-                cleanDeadList(base :: (case index of SOME i => [i] | NONE => []))
+        |   cleanDead(context, LoadOperation{address={base, index, ...}, ...}) =
+                cleanDeadList(context, base :: (case index of SOME i => [i] | NONE => []))
 
-        |   cleanDead(AllocateWordMemory{numWords, flags, initial}) =
-                cleanDeadList[numWords, flags, initial]
+        |   cleanDead(context, AllocateWordMemory{numWords, flags, initial}) =
+                cleanDeadList(context, [numWords, flags, initial])
 
             (* A block move is a store (keep); byte equality/compare is applicative. *)
-        |   cleanDead(code as BlockOperation{kind, sourceLeft, destRight, length}) =
+        |   cleanDead(context, code as BlockOperation{kind, sourceLeft, destRight, length}) =
                 (
                     case kind of
-                        BlockOpMove _ => SOME(cleanCode(code, [UseGeneral]))
+                        BlockOpMove _ => SOME(cleanCode(context, code, [UseGeneral]))
                     |   _ =>
                         let
                             fun addrParts{base, index, ...} =
                                 base :: (case index of SOME i => [i] | NONE => [])
                         in
-                            cleanDeadList(addrParts sourceLeft @ addrParts destRight @ [length])
+                            cleanDeadList(context, addrParts sourceLeft @ addrParts destRight @ [length])
                         end
                 )
 
             (* Arbitrary precision: the compiler treats its operands as just [arg1, arg2]
                (see evaluateInlining); shortCond and longCall are pure functions of them. *)
-        |   cleanDead(Arbitrary{arg1, arg2, ...}) = cleanDeadList[arg1, arg2]
+        |   cleanDead(context, Arbitrary{arg1, arg2, ...}) = cleanDeadList(context, [arg1, arg2])
 
             (* Keep the loop, but clean its body dead: every exit branch (a tail-position
                expression that is not a Loop) has its now-unused result discarded, and any
                loop argument that only fed such a branch is dropped. *)
-        |   cleanDead(BeginLoop{loop, arguments}) = SOME(cleanBeginLoop((loop, arguments), []))
+        |   cleanDead(context, BeginLoop{loop, arguments}) = SOME(cleanBeginLoop(context, (loop, arguments), []))
 
             (* Keep the call (it has an effect), but tell the function its result is
                unused: mark it UseApply with an empty result usage.  A function whose
                call sites discard the result then has bodyUse = [] in cleanLambda and
                so has its body dead-cleaned. *)
-        |   cleanDead(Eval eval) = SOME(cleanEval(eval, []))
+        |   cleanDead(context, Eval eval) = SOME(cleanEval(context, eval, []))
 
-        |   cleanDead(Extract _) = NONE
-        |   cleanDead(Constnt _) = NONE
-        |   cleanDead(Lambda _) = NONE
+        |   cleanDead(_, Extract _) = NONE
+        |   cleanDead(_, Constnt _) = NONE
+        |   cleanDead(_, Lambda _) = NONE
 
-            (* Everything else — Raise, Loop, StoreOperation, SetContainer — always carries
-               a side-effect, so keep it with the result discarded. *)
-        |   cleanDead code = SOME(cleanCode(code, [UseGeneral]))
+            (* Everything else — Raise, Loop, StoreOperation, SetContainer — always carries a
+               side-effect, so keep it with the result discarded. *)
+        |   cleanDead(context, code) = SOME(cleanCode(context, code, [UseGeneral]))
 
-        and cleanCode (code, codeUse) =
+        and cleanCode (context: cleanContext, code, codeUse) =
         let
-            fun doClean codeUse (Newenv nenv) = SOME(Option.getOpt(cleanNewenv(nenv, codeUse), CodeZero))
+            fun doClean codeUse (Newenv nenv) = SOME(Option.getOpt(cleanNewenv(context, nenv, codeUse), CodeZero))
 
                 (* Reference to a binding. *)
-            |   doClean codeUse (Extract ext) = SOME(Extract(cleanExtract(ext, codeUse)))
+            |   doClean codeUse (Extract ext) = SOME(Extract(cleanExtract(context, ext, codeUse)))
 
                 (* Select a field from a tuple or container.  We can't do this for selection from datatypes because
                    some fields may not be present on all paths. *)
@@ -475,7 +485,7 @@ struct
                 in
                     case indKind of
                          IndVariant => NONE
-                    |    _ => SOME(Indirect{base=cleanCode(base, [UseField(offset, codeUse)]), offset=offset, indKind = indKind})
+                    |    _ => SOME(Indirect{base=cleanCode(context, base, [UseField(offset, codeUse)]), offset=offset, indKind = indKind})
                 end
 
             |   doClean codeUse (Tuple{ fields, isVariant = false}) =
@@ -489,43 +499,40 @@ struct
 
                     fun fieldUses n =
                         List.foldl(fieldUse n) [] codeUse
-                            
+
                     fun processField([], _) = []
                     |   processField(hd::tl, n) =
-                            cleanCode(hd, fieldUses n) :: processField(tl, n+1)
+                            cleanCode(context, hd, fieldUses n) :: processField(tl, n+1)
                 in
                     SOME(Tuple{ fields = processField(fields, 0), isVariant = false})
                 end
 
-            |   doClean codeUse (Lambda lam) = SOME(Lambda(cleanLambda(lam, codeUse)))
+            |   doClean codeUse (Lambda lam) = SOME(Lambda(cleanLambda(context, lam, codeUse)))
 
-            |   doClean codeUse (Eval eval) = SOME(cleanEval(eval, codeUse))
+            |   doClean codeUse (Eval eval) = SOME(cleanEval(context, eval, codeUse))
 
             |   doClean codeUse (Cond(i, t, e)) =
-                    SOME(Cond(cleanCode(i, [UseGeneral]), cleanCode(t, codeUse), cleanCode(e, codeUse)))
+                    SOME(Cond(cleanCode(context, i, [UseGeneral]), cleanCode(context, t, codeUse), cleanCode(context, e, codeUse)))
 
-            |   doClean use (BeginLoop{loop, arguments}) = SOME(cleanBeginLoop((loop, arguments), use))
+            |   doClean use (BeginLoop{loop, arguments}) = SOME(cleanBeginLoop(context, (loop, arguments), use))
 
             |   doClean _ _ = NONE (* Anything else *)
-            
+
         in
             (* If we recognise this as a special case we use the result otherwise
                we process it as a general value using UseGeneral as the usage. *)
             if null codeUse
-            then Option.getOpt(cleanDead code,CodeZero)
+            then Option.getOpt(cleanDead(context, code), CodeZero)
             else
             (case doClean codeUse code of
                 SOME result => result
             |   NONE => mapCodetree (doClean [UseGeneral]) code)
         end
-
     in
-        cleanCode (pt, procUses)
-    end (* cleanProc *)
-
-    val cleanProc =
-        fn (code, prev, localCount) =>
-            cleanProc(code, [UseExport], fn (i, _) => prev i, fn _ => (), localCount, fn _ => ())
+        cleanCode({ locals = Array.array(localCount, []), prev = fn (i, _) => prev i,
+                    recursiveRef = fn _ => (), checkArg = fn _ => () },
+                  code, [UseExport])
+    end
 
     structure Sharing =
     struct
