@@ -514,6 +514,11 @@ struct
             |   doClean codeUse (Cond(i, t, e)) =
                     SOME(Cond(cleanCode(context, i, [UseGeneral]), cleanCode(context, t, codeUse), cleanCode(context, e, codeUse)))
 
+            |   doClean codeUse (Handle{exp, handler, exPacketAddr}) =
+                    SOME(Handle{exp = cleanCode(context, exp, codeUse),
+                                handler = cleanCode(context, handler, codeUse),
+                                exPacketAddr = exPacketAddr})
+
             |   doClean use (BeginLoop{loop, arguments}) = SOME(cleanBeginLoop(context, (loop, arguments), use))
 
             |   doClean _ _ = NONE (* Anything else *)
