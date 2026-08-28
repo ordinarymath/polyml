@@ -809,7 +809,10 @@ struct
 
     |   optimise (context as { reprocess, makeAddr, codeTreePrinter, ... }, use) (Newenv(envDecs, envExp)) =
         let
-            fun mapExp mapUse = mapCodetree (optimise(context, mapUse))
+            fun mapExp mapUse code =
+                case optimise (context, mapUse) code of
+                    SOME result => result
+                |   NONE => mapCodetree (optimise(context, [UseGeneral])) code
 
             fun mapbinding(Declar{value, addr, use}) = Declar{value=mapExp use value, addr=addr, use=use}
             |   mapbinding(RecDecs l) =
@@ -949,7 +952,13 @@ struct
             (* We duplicate the function arguments which could cause the size of the code
                to blow-up if they involve complicated expressions. *)
             fun pushFunction l =
-                 mapCodetree (optimise(context, use)) (Eval{function=l, argList=argList, resultType=resultType})
+            let
+                val code = Eval{function=l, argList=argList, resultType=resultType}
+            in
+                case optimise (context, use) code of
+                    SOME result => result
+                |   NONE => mapCodetree (optimise(context, [UseGeneral])) code
+            end
         in
             reprocess := true;
             codeTreePrinter(PrettyString "Optimiser: Eval(if...) => if ... Eval else Eval");
@@ -962,17 +971,27 @@ struct
         let
             val args = map (fn (c, t) => (optGeneral context c, t)) argList
             val argTuples = map #1 args
+            val optFunction =
+                case optimise (context, [UseApply(use, argTuples)]) function of
+                    SOME result => result
+                |   NONE => mapCodetree (optimise(context, [UseGeneral])) function
         in
             SOME(
                 Eval{
-                    function= mapCodetree (optimise (context, [UseApply(use, argTuples)])) function,
+                    function= optFunction,
                     argList=args, resultType = resultType
                 })
         end
 
     |   optimise (context, use) (Indirect{base, offset, indKind = IndTuple}) =
-        SOME(Indirect{base = mapCodetree (optimise(context, [UseField(offset, use)])) base,
-                      offset = offset, indKind = IndTuple})
+        let
+            val optBase =
+                case optimise (context, [UseField(offset, use)]) base of
+                    SOME result => result
+                |   NONE => mapCodetree (optimise(context, [UseGeneral])) base
+        in
+            SOME(Indirect{base = optBase, offset = offset, indKind = IndTuple})
+        end
 
     |   optimise (context, use) (code as Cond(i, t, e)) =
         (* If the result of the if-then-else is always taken apart as fields
@@ -994,6 +1013,11 @@ struct
 
     |   optimise (context as { makeAddr, reprocess, codeTreePrinter, ...}, use) (code as BeginLoop{loop, arguments}) =
         let
+            fun mapExp mapUse code =
+                case optimise (context, mapUse) code of
+                    SOME result => result
+                |   NONE => mapCodetree (optimise(context, [UseGeneral])) code
+
             (* If an argument is a tuple and always taken apart within the loop we should
                replace it with arguments for the fields.  This is the same as detupling
                function arguments.
@@ -1102,7 +1126,17 @@ struct
                    this down as well. *)
                 if List.all(fn UseField _ => true | _ => false) use
                 then SOME(optFields(code, context, use))
-                else NONE
+                else
+                (* It's unsafe to detuple within a loop since it could potentially leave
+                   a Loop in a non tail position. Currently it's safe to generalize since
+                   the optFields check runs before this but still defensively swap into
+                   using [UseGeneral]. *)
+                SOME(BeginLoop{
+                        loop = mapExp [UseGeneral] loop,
+                        arguments =
+                            map (fn ({value, addr, use=argUse}, t) =>
+                                    ({value=mapExp argUse value, addr=addr, use=argUse}, t))
+                                arguments})
         end
 
     |   optimise _ _ = NONE
@@ -1626,7 +1660,10 @@ struct
                     then (preOptCode, optimisedOnce, simpAgain)
                     else
                     let
-                        val postOptCode = mapCodetree (optimise(optContext, [UseExport])) preOptCode
+                        val postOptCode =
+                            case optimise (optContext, [UseExport]) preOptCode of
+                                SOME result => result
+                            |   NONE => mapCodetree (optimise(optContext, [UseGeneral])) preOptCode
                         (* Print the code after the optimiser. *)
                         val () = codeTreePrinter(Pretty.PrettyString "Output of optimiser")
                         val () = codeTreePrinter(BaseCodeTree.pretty postOptCode)
