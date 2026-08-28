@@ -877,7 +877,20 @@ struct
             else SOME(Handle{exp=optGeneral context exp, handler=optGeneral context handler, exPacketAddr=exPacketAddr})
 
         |   doOptimise use (code as BeginLoop{loop, arguments}) =
+            (* If the result of the loop is only ever taken apart, push that down
+               before considering the arguments.  optFields walks this BeginLoop
+               again with [UseGeneral], which is where the detupling below then
+               happens, so we do not lose it. *)
+            if List.all(fn UseField _ => true | _ => false) use
+            then SOME(optFields(code, context, use))
+            else
             let
+                (* It's unsafe to detuple within a loop since it could potentially
+                   leave a Loop in a non tail position. Currently it's safe to
+                   generalize since the optFields check runs before this but still
+                   defensively swap into using [UseGeneral]. *)
+                val use = [UseGeneral]
+
                 (* If an argument is a tuple and always taken apart within the loop we should
                    replace it with arguments for the fields.  This is the same as detupling
                    function arguments.
@@ -982,17 +995,8 @@ struct
                     end
 
                 |   NONE =>
-                    (* If the result of the loop is taken apart we should push
-                       this down as well. *)
-                    if List.all(fn UseField _ => true | _ => false) use
-                    then SOME(optFields(code, context, use))
-                    else
-                    (* It's unsafe to detuple within a loop since it could potentially
-                       leave a Loop in a non tail position. Currently it's safe to
-                       generalize since the optFields check runs before this but still
-                       defensively swap into using [UseGeneral]. *)
                     SOME(BeginLoop{
-                            loop = optimise(context, loop, [UseGeneral]),
+                            loop = optimise(context, loop, use),
                             arguments =
                                 map (fn ({value, addr, use=argUse}, t) =>
                                         ({value=optimise(context, value, argUse),
