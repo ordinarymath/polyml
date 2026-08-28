@@ -804,14 +804,17 @@ struct
     |   mapLambdaResult(bindings, lambda) =
             mkEnv([RecDecs(map(fn(addr, lam) => {addr=addr, use=[], lambda=lam}) bindings)], lambda)
 
-    (* How optimiseResult finishes off a result chain: loop_fn is applied to the
-       arguments of every Loop that belongs to the enclosing BeginLoop.  It is the
-       Loop constructor for an ordinary walk, which makes optimiseResult with
-       valueResult exactly optimise. *)
+    (* How optimiseResult finishes off the two kinds of end of a result chain.
+       loop_fn is applied to the arguments of every Loop that belongs to the enclosing
+       BeginLoop; leaf_fn is applied to the value at every leaf, before that value is
+       optimised, so a transformation can push something down to the leaves as the
+       walk reaches them rather than in a separate pass.  Both are the identity for
+       an ordinary walk, which makes optimiseResult with valueResult exactly
+       optimise. *)
     type resultContext =
-        { loop_fn: (codetree * argumentType) list -> codetree }
+        { loop_fn: (codetree * argumentType) list -> codetree, leaf_fn: codetree -> codetree }
 
-    val valueResult: resultContext = { loop_fn = Loop }
+    val valueResult: resultContext = { loop_fn = Loop, leaf_fn = fn code => code }
 
     fun optimise (context, code, use) =
     let
@@ -908,8 +911,9 @@ struct
     and optGeneral context exp = optimise(context, exp, [UseGeneral])
 
     (* Optimise a result position of the enclosing BeginLoop, applying the tail hook
-       to every Loop that belongs to it. *)
-    and optimiseResult (context, tailContext as { loop_fn }, code, use) =
+       to every Loop that belongs to it and the leaf hook to every value that is the
+       result. *)
+    and optimiseResult (context, tailContext as { loop_fn, leaf_fn }, code, use) =
     let
         val use = case use of [] => [UseGeneral] | _ => use
         fun allFields use = List.all(fn UseField _ => true | _ => false) use
@@ -937,14 +941,14 @@ struct
                 if allFields use
                 then optFields(code, context, tailContext, use)
                 else
-                Handle{exp = optimiseResult(context, valueResult, exp, [UseGeneral]),
+                Handle{exp = optimiseResult(context, { loop_fn = #loop_fn valueResult, leaf_fn = leaf_fn }, exp, [UseGeneral]),
                        handler = optimiseResult(context, tailContext, handler, [UseGeneral]),
                        exPacketAddr = exPacketAddr}
 
-        |   _ => optimise(context, code, use)
+        |   _ => optimise(context, leaf_fn code, use)
     end
 
-    and optimiseBeginLoop (context as { reprocess, makeAddr, codeTreePrinter, ...}, tailContext, loop, arguments) =
+    and optimiseBeginLoop (context as { reprocess, makeAddr, codeTreePrinter, ...}, tailContext as { loop_fn = _, leaf_fn }, loop, arguments) =
     let
         (* It's unsafe to detuple within a loop since it could potentially
            leave a Loop in a non tail position. Currently it's safe to
@@ -1046,7 +1050,7 @@ struct
                 val tupleForBody = mkTuple(map(fn a => Extract(LoadLocal a)) tupleAddrs)
                 val newLoop =
                     mkEnv([Declar{addr=addrForTuple, value=tupleForBody, use=[UseGeneral]}],
-                          optimiseResult(context, { loop_fn = detupleLoopArgs }, loop, use))
+                          optimiseResult(context, { loop_fn = detupleLoopArgs, leaf_fn = leaf_fn }, loop, use))
 
                 val () = reprocess := true
                 val () = codeTreePrinter(PrettyString "Optimiser: replace loop")
@@ -1056,10 +1060,11 @@ struct
             end
 
         |   NONE =>
-            (* Both the body and the initial values take the default tail
-               context: their Loops are ours, not the enclosing loop's. *)
+            (* The body's Loops are ours so it takes the default tail hook, but
+               it keeps the leaf hook - it sits inside whatever is being pushed
+               down. *)
             BeginLoop{
-                    loop = optimise(context, loop, use),
+                    loop = optimiseResult(context, { loop_fn = #loop_fn valueResult, leaf_fn = leaf_fn }, loop, use),
                     arguments =
                         map (fn ({value, addr, use=argUse}, t) =>
                                 ({value=optimise(context, value, argUse),
@@ -1452,7 +1457,10 @@ struct
             end
     end
 
-    and optFields (code, context as { reprocess, makeAddr, codeTreePrinter, ...}, tailContext, use) =
+    (* optFields is only called when every use is a UseField, and a live/non-identity
+       leaf hook only ever propagates along a chain carrying [UseGeneral] so there
+       isn't a need to compose. i.e. it will only be called when leaf_fn = fn loop => loop. *)
+    and optFields (code, context as { reprocess, makeAddr, codeTreePrinter, ...}, { loop_fn, leaf_fn = _ }, use) =
     let
         (* We have an if-then-else or a loop whose result is only ever
            taken apart.  We push this down. *)
@@ -1468,26 +1476,8 @@ struct
             val useList = BoolArray.foldri (fn (i, true, l) => i :: l | (_, _, l) => l) [] fieldUse
         end
 
-        fun pushContainer(Cond(ifpt, thenpt, elsept), leafFn) =
-                Cond(ifpt, pushContainer(thenpt, leafFn), pushContainer(elsept, leafFn))
-
-        |   pushContainer(Newenv(decs, exp), leafFn) =
-                Newenv(decs, pushContainer(exp, leafFn))
-
-        |   pushContainer(BeginLoop{loop, arguments}, leafFn) =
-                (* If we push it through a BeginLoop we MUST then push it through
-                   anything that could contain the Loop i.e. Cond, Newenv, Handle. *)
-                BeginLoop{loop = pushContainer(loop, leafFn), arguments=arguments}
-
-        |   pushContainer(l as Loop _, _) = l
-                (* Within a BeginLoop only the non-Loop leaves return
-                   values.  Loop entries go back to the BeginLoop so
-                   these are unchanged. *)
-
-        |   pushContainer(Handle{exp, handler, exPacketAddr}, leafFn) =
-                Handle{exp=pushContainer(exp, leafFn), handler=pushContainer(handler, leafFn), exPacketAddr=exPacketAddr}
-
-        |   pushContainer(tuple, leafFn) = leafFn tuple (* Anything else. *)
+        fun pushToLeaves leafFn =
+            optimiseResult(context, { loop_fn = loop_fn, leaf_fn = leafFn }, code, [UseGeneral])
 
         val () = reprocess := true
         val () = codeTreePrinter(PrettyString "Optimiser: pushed container")
@@ -1498,8 +1488,7 @@ struct
                 (* However the context still requires a tuple.  We need to
                    reconstruct one with unused fields set to zero.  They will
                    be filtered out later by the simplifier pass. *)
-                val field =
-                    optimiseResult(context, tailContext, pushContainer(code, fn t => mkInd(offset, t)), [UseGeneral])
+                val field = pushToLeaves (fn t => mkInd(offset, t))
                 fun mkFields n = if n = offset then field else CodeZero
             in
                 Tuple{ fields = List.tabulate(offset+1, mkFields), isVariant = false }
@@ -1511,11 +1500,11 @@ struct
                 val containerAddr = makeAddr()
                 val width = List.length useList
                 val loadContainer = Extract(LoadLocal containerAddr)
-
+                val filter = fieldsToFilter useList
                 fun setContainer tuple = (* At the leaf set the container. *)
-                    SetContainer{container = loadContainer, tuple = tuple, filter = fieldsToFilter useList }
+                    mkSetContainer(loadContainer, tuple, filter)
 
-                val setCode = optimiseResult(context, tailContext, pushContainer(code, setContainer), [UseGeneral])
+                val setCode = pushToLeaves setContainer
                 val makeContainer =
                     Container{addr=containerAddr, use=[], size=width, setter=setCode}
                 (* The context requires a tuple of the original width.  We need
