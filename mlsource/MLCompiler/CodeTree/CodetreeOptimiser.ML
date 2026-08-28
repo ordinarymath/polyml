@@ -866,6 +866,7 @@ struct
                                           BeginLoop {loop = updateContainer leafFn loop,arguments = arguments}
                                   | updateContainer leafFn (SetContainer {tuple,filter,...}) = leafFn (tuple,filter)
                                   | updateContainer _ exp = exp
+
                                 val newSize = BoolVector.foldl (fn (true, n) => n+1 | (false, n) => n) 0 newFilter
                             in
                                 if newSize = 1
@@ -888,7 +889,8 @@ struct
                                     end
                                     (* Find the offset *)
                                     val (offset,_) = valOf (BoolVector.findi (fn (_, b) => b) newFilter)
-                                    val field = updateContainer (fn (tuple,filter) => mkInd(nthTrueIndex(offset,filter), tuple)) setter
+                                    val field =
+                                        optGeneral context (updateContainer (fn (tuple,filter) => mkInd(nthTrueIndex(offset,filter), tuple)) setter)
                                     fun mkFields n = if n = offset then field else CodeZero
                                     val fields = List.tabulate(BoolVector.length newFilter, mkFields)
                                     val container = SetContainer{container= Extract(LoadLocal addr),
@@ -913,7 +915,8 @@ struct
                                     end
                                     val newAddr = makeAddr()
                                     val newContainer = Extract(LoadLocal newAddr)
-                                    val newSetter = updateContainer (fn (tuple,filter) => mkSetContainer(newContainer, tuple, maskOut(filter,newFilter))) setter
+                                    val newSetter =
+                                        optGeneral context (updateContainer (fn (tuple,filter) => mkSetContainer(newContainer, tuple, maskOut(filter,newFilter))) setter)
                                     val makeContainer = Container{addr=newAddr, use=[], size=newSize, setter = newSetter}
                                     val fields = List.rev (#2 (BoolVector.foldl
                                             (fn (true,(a,l)) => (a+1,(mkIndContainer(a,newContainer))::l)
