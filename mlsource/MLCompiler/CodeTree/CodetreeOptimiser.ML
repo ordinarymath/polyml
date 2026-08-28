@@ -804,344 +804,333 @@ struct
     |   mapLambdaResult(bindings, lambda) =
             mkEnv([RecDecs(map(fn(addr, lam) => {addr=addr, use=[], lambda=lam}) bindings)], lambda)
 
-    fun optimise (context, use) (Lambda lambda) =
-            SOME(mapLambdaResult(optLambda(context, use, lambda, LCNormal)))
+    fun optimise (context, code, use) =
+    let
+        val { reprocess, makeAddr, codeTreePrinter, maxInlineSize = _ } = context
 
-    |   optimise (context as { reprocess, makeAddr, codeTreePrinter, ... }, use) (Newenv(envDecs, envExp)) =
-        let
-            fun mapExp mapUse code =
-                case optimise (context, mapUse) code of
-                    SOME result => result
-                |   NONE => mapCodetree (optimise(context, [UseGeneral])) code
+        fun doOptimise use (Lambda lambda) =
+                SOME(mapLambdaResult(optLambda(context, use, lambda, LCNormal)))
 
-            fun mapbinding(Declar{value, addr, use}) = Declar{value=mapExp use value, addr=addr, use=use}
-            |   mapbinding(RecDecs l) =
-                let
-                    fun mapRecDec({addr, lambda, use}, rest) =
-                        case optLambda(context, use, lambda, LCRecursive) of
-                            (bindings, Lambda lambdaRes) =>
-                                (* Turn any bindings into extra mutually-recursive functions. *)
-                                {addr=addr, use = use, lambda = lambdaRes } ::
-                                    map (fn (addr, res) => {addr=addr, use=use, lambda=res }) bindings @ rest
-                        |   _ => raise InternalError "mapbinding: not lambda"
-                in
-                    RecDecs(foldl mapRecDec [] l)
-                end
-            |   mapbinding(NullBinding exp) = NullBinding(mapExp [UseGeneral] exp)
-            |   mapbinding(Container{addr, use, size, setter}) =
-                let
-                    fun returnsContainer (Newenv(_, exp)) = returnsContainer exp
-                      | returnsContainer (Cond(_, t, e)) = returnsContainer t andalso returnsContainer e
-                      | returnsContainer (Handle {exp, handler, ...}) = returnsContainer exp andalso returnsContainer handler
-                      | returnsContainer (Raise _) =  true
-                      | returnsContainer (BeginLoop {loop, ...}) = returnsContainer loop
-                      | returnsContainer (Loop _) = true
-                      | returnsContainer (SetContainer _) = true
-                      | returnsContainer _ = false
-
-                    val redundant_fields   =
-                        if List.all(fn UseField _ => true | _ => false) use
-                        then
-                        let val newFilter = BoolVector.tabulate(size,
-                                  (fn i => List.exists (fn UseField(n,_) => n = i
-                                                         | _ => false) use))
-                        in
-                           if BoolVector.all (fn i => i) newFilter then NONE
-                           else SOME newFilter
-                        end
-                        else NONE
-                in
-                   case redundant_fields of
-                        NONE => Container{addr=addr, use=use, size=size, setter = mapExp [UseGeneral] setter}
-                   |    SOME newFilter =>
-                        if returnsContainer setter then
-                        let
-                            fun updateContainer leafFn (Newenv(envDecs, exp)) =
-                                      Newenv(envDecs, updateContainer leafFn exp)
-                              | updateContainer leafFn (Cond(i, t, e)) =
-                                      Cond(i,updateContainer leafFn t,updateContainer leafFn e)
-                              | updateContainer leafFn (Handle {exp, handler, exPacketAddr}) =
-                                      Handle{exp= updateContainer leafFn exp, handler = updateContainer leafFn handler, exPacketAddr=exPacketAddr}
-                              | updateContainer leafFn (BeginLoop {loop, arguments}) =
-                                      BeginLoop {loop = updateContainer leafFn loop,arguments = arguments}
-                              | updateContainer leafFn (SetContainer {tuple,filter,...}) = leafFn (tuple,filter)
-                              | updateContainer _ exp = exp
-                            val newSize = BoolVector.foldl (fn (true, n) => n+1 | (false, n) => n) 0 newFilter
-                        in
-                            if newSize = 1
-                            then
-                            let
-                                fun nthTrueIndex (n, vec) =
-                                let
-                                   val len = BoolVector.length vec
-                                   fun loop (i, count) =
-                                     if i = len
-                                     then raise InternalError "nthTrueIndex"
-                                     else if BoolVector.sub(vec, i)
-                                     then
-                                         if count = n then i
-                                         else loop (i+1, count+1)
-                                     else
-                                         loop (i+1, count)
-                                in
-                                   (loop (0, 0))
-                                end
-                                (* Find the offset *)
-                                val (offset,_) = valOf (BoolVector.findi (fn (_, b) => b) newFilter)
-                                val field = updateContainer (fn (tuple,filter) => mkInd(nthTrueIndex(offset,filter), tuple)) setter
-                                fun mkFields n = if n = offset then field else CodeZero
-                                val fields = List.tabulate(BoolVector.length newFilter, mkFields)
-                                val container = SetContainer{container= Extract(LoadLocal addr),
-                                                             tuple= Tuple{fields =fields ,isVariant=false},
-                                                             filter=BoolVector.tabulate(size,fn _ => true)}
-                            in
-                                reprocess := true;
-                                codeTreePrinter(PrettyString "Optimiser: Container; newSize = 1");
-                                Container{addr=addr, use=use, size=size, setter = container}
-                            end
-                            else
-                            let
-                                fun maskOut (vec, filt) =
-                                let
-                                    val filter_index = ref 0
-                                    fun f n = if BoolVector.sub(vec,n)
-                                              then (BoolVector.sub(filt,!filter_index)
-                                                    before filter_index := !filter_index + 1)
-                                              else false
-                                in
-                                    BoolVector.tabulate(BoolVector.length vec,f)
-                                end
-                                val newAddr = makeAddr()
-                                val newContainer = Extract(LoadLocal newAddr)
-                                val newSetter = updateContainer (fn (tuple,filter) => mkSetContainer(newContainer, tuple, maskOut(filter,newFilter))) setter
-                                val makeContainer = Container{addr=newAddr, use=[], size=newSize, setter = newSetter}
-                                val fields = List.rev (#2 (BoolVector.foldl
-                                        (fn (true,(a,l)) => (a+1,(mkIndContainer(a,newContainer))::l)
-                                          | (false,(a,l)) => (a,CodeZero::l)) (0,[]) newFilter))
-                                val container = SetContainer{container= Extract(LoadLocal addr),
-                                                             tuple= Tuple{fields =fields ,isVariant=false},
-                                                             filter=BoolVector.tabulate(size,fn _ => true)}
-                            in
-                                reprocess := true;
-                                codeTreePrinter(PrettyString "Optimiser: Container; newSize <>= 1");
-                                Container{addr=addr, use=use, size=size, setter=mkEnv([makeContainer], container)}
-                            end
-                        end
-                        else Container{addr=addr, use=use, size=size, setter = mapExp [UseGeneral] setter}
-                end
-        in
-            SOME(Newenv(map mapbinding envDecs, mapExp use envExp))
-        end
-
-        (* Immediate call to a function.  We may be able to expand this inline unless it
-           is recursive. *)
-    |   optimise (context, use) (Eval {function = Lambda lambda, argList, resultType}) =
-        let
-            val args = map (fn (c, t) => (optGeneral context c, t)) argList
-            val argTuples = map #1 args
-            val (bindings, newLambda) = optLambda(context, [UseApply(use, argTuples)], lambda, LCImmediateCall)
-            val call = Eval { function=newLambda, argList=args, resultType = resultType }
-        in
-            SOME(mapLambdaResult(bindings, call))
-        end
-
-    |   optimise (context as { reprocess, codeTreePrinter, ...}, use) (Eval {function = Cond(i, t, e), argList, resultType}) =
-        let
-            (* Transform "(if i then t else e) x" into "if i then t x else e x".  This
-               allows for other optimisations and inline expansion. *)
-            (* We duplicate the function arguments which could cause the size of the code
-               to blow-up if they involve complicated expressions. *)
-            fun pushFunction l =
+        |   doOptimise use (Newenv(envDecs, envExp)) =
             let
-                val code = Eval{function=l, argList=argList, resultType=resultType}
+                fun mapbinding(Declar{value, addr, use}) =
+                        Declar{value=optimise(context, value, use), addr=addr, use=use}
+                |   mapbinding(RecDecs l) =
+                    let
+                        fun mapRecDec({addr, lambda, use}, rest) =
+                            case optLambda(context, use, lambda, LCRecursive) of
+                                (bindings, Lambda lambdaRes) =>
+                                    (* Turn any bindings into extra mutually-recursive functions. *)
+                                    {addr=addr, use = use, lambda = lambdaRes } ::
+                                        map (fn (addr, res) => {addr=addr, use=use, lambda=res }) bindings @ rest
+                            |   _ => raise InternalError "mapbinding: not lambda"
+                    in
+                        RecDecs(foldl mapRecDec [] l)
+                    end
+                |   mapbinding(NullBinding exp) = NullBinding(optGeneral context exp)
+                |   mapbinding(Container{addr, use, size, setter}) =
+                    let
+                        fun returnsContainer (Newenv(_, exp)) = returnsContainer exp
+                          | returnsContainer (Cond(_, t, e)) = returnsContainer t andalso returnsContainer e
+                          | returnsContainer (Handle {exp, handler, ...}) = returnsContainer exp andalso returnsContainer handler
+                          | returnsContainer (Raise _) =  true
+                          | returnsContainer (BeginLoop {loop, ...}) = returnsContainer loop
+                          | returnsContainer (Loop _) = true
+                          | returnsContainer (SetContainer _) = true
+                          | returnsContainer _ = false
+
+                        val redundant_fields   =
+                            if List.all(fn UseField _ => true | _ => false) use
+                            then
+                            let val newFilter = BoolVector.tabulate(size,
+                                      (fn i => List.exists (fn UseField(n,_) => n = i
+                                                             | _ => false) use))
+                            in
+                               if BoolVector.all (fn i => i) newFilter then NONE
+                               else SOME newFilter
+                            end
+                            else NONE
+                    in
+                       case redundant_fields of
+                            NONE => Container{addr=addr, use=use, size=size, setter = optGeneral context setter}
+                       |    SOME newFilter =>
+                            if returnsContainer setter then
+                            let
+                                fun updateContainer leafFn (Newenv(envDecs, exp)) =
+                                          Newenv(envDecs, updateContainer leafFn exp)
+                                  | updateContainer leafFn (Cond(i, t, e)) =
+                                          Cond(i,updateContainer leafFn t,updateContainer leafFn e)
+                                  | updateContainer leafFn (Handle {exp, handler, exPacketAddr}) =
+                                          Handle{exp= updateContainer leafFn exp, handler = updateContainer leafFn handler, exPacketAddr=exPacketAddr}
+                                  | updateContainer leafFn (BeginLoop {loop, arguments}) =
+                                          BeginLoop {loop = updateContainer leafFn loop,arguments = arguments}
+                                  | updateContainer leafFn (SetContainer {tuple,filter,...}) = leafFn (tuple,filter)
+                                  | updateContainer _ exp = exp
+                                val newSize = BoolVector.foldl (fn (true, n) => n+1 | (false, n) => n) 0 newFilter
+                            in
+                                if newSize = 1
+                                then
+                                let
+                                    fun nthTrueIndex (n, vec) =
+                                    let
+                                       val len = BoolVector.length vec
+                                       fun loop (i, count) =
+                                         if i = len
+                                         then raise InternalError "nthTrueIndex"
+                                         else if BoolVector.sub(vec, i)
+                                         then
+                                             if count = n then i
+                                             else loop (i+1, count+1)
+                                         else
+                                             loop (i+1, count)
+                                    in
+                                       (loop (0, 0))
+                                    end
+                                    (* Find the offset *)
+                                    val (offset,_) = valOf (BoolVector.findi (fn (_, b) => b) newFilter)
+                                    val field = updateContainer (fn (tuple,filter) => mkInd(nthTrueIndex(offset,filter), tuple)) setter
+                                    fun mkFields n = if n = offset then field else CodeZero
+                                    val fields = List.tabulate(BoolVector.length newFilter, mkFields)
+                                    val container = SetContainer{container= Extract(LoadLocal addr),
+                                                                 tuple= Tuple{fields =fields ,isVariant=false},
+                                                                 filter=BoolVector.tabulate(size,fn _ => true)}
+                                in
+                                    reprocess := true;
+                                    codeTreePrinter(PrettyString "Optimiser: Container; newSize = 1");
+                                    Container{addr=addr, use=use, size=size, setter = container}
+                                end
+                                else
+                                let
+                                    fun maskOut (vec, filt) =
+                                    let
+                                        val filter_index = ref 0
+                                        fun f n = if BoolVector.sub(vec,n)
+                                                  then (BoolVector.sub(filt,!filter_index)
+                                                        before filter_index := !filter_index + 1)
+                                                  else false
+                                    in
+                                        BoolVector.tabulate(BoolVector.length vec,f)
+                                    end
+                                    val newAddr = makeAddr()
+                                    val newContainer = Extract(LoadLocal newAddr)
+                                    val newSetter = updateContainer (fn (tuple,filter) => mkSetContainer(newContainer, tuple, maskOut(filter,newFilter))) setter
+                                    val makeContainer = Container{addr=newAddr, use=[], size=newSize, setter = newSetter}
+                                    val fields = List.rev (#2 (BoolVector.foldl
+                                            (fn (true,(a,l)) => (a+1,(mkIndContainer(a,newContainer))::l)
+                                              | (false,(a,l)) => (a,CodeZero::l)) (0,[]) newFilter))
+                                    val container = SetContainer{container= Extract(LoadLocal addr),
+                                                                 tuple= Tuple{fields =fields ,isVariant=false},
+                                                                 filter=BoolVector.tabulate(size,fn _ => true)}
+                                in
+                                    reprocess := true;
+                                    codeTreePrinter(PrettyString "Optimiser: Container; newSize <>= 1");
+                                    Container{addr=addr, use=use, size=size, setter=mkEnv([makeContainer], container)}
+                                end
+                            end
+                            else Container{addr=addr, use=use, size=size, setter = optGeneral context setter}
+                    end
             in
-                case optimise (context, use) code of
-                    SOME result => result
-                |   NONE => mapCodetree (optimise(context, [UseGeneral])) code
+                SOME(Newenv(map mapbinding envDecs, optimise(context, envExp, use)))
             end
-        in
-            reprocess := true;
-            codeTreePrinter(PrettyString "Optimiser: Eval(if...) => if ... Eval else Eval");
-            SOME(Cond(i, pushFunction t, pushFunction e))
-        end
 
-    |   optimise (context, use) (Eval {function, argList, resultType}) =
-        (* If nothing else we need to ensure that "use" is correctly set on
-           the function and arguments and we don't simply pass the original. *)
-        let
-            val args = map (fn (c, t) => (optGeneral context c, t)) argList
-            val argTuples = map #1 args
-            val optFunction =
-                case optimise (context, [UseApply(use, argTuples)]) function of
-                    SOME result => result
-                |   NONE => mapCodetree (optimise(context, [UseGeneral])) function
-        in
-            SOME(
-                Eval{
-                    function= optFunction,
-                    argList=args, resultType = resultType
-                })
-        end
+            (* Immediate call to a function.  We may be able to expand this inline unless it
+               is recursive. *)
+        |   doOptimise use (Eval {function = Lambda lambda, argList, resultType}) =
+            let
+                val args = map (fn (c, t) => (optGeneral context c, t)) argList
+                val argTuples = map #1 args
+                val (bindings, newLambda) = optLambda(context, [UseApply(use, argTuples)], lambda, LCImmediateCall)
+                val call = Eval { function=newLambda, argList=args, resultType = resultType }
+            in
+                SOME(mapLambdaResult(bindings, call))
+            end
 
-    |   optimise (context, use) (Indirect{base, offset, indKind = IndTuple}) =
-        let
-            val optBase =
-                case optimise (context, [UseField(offset, use)]) base of
-                    SOME result => result
-                |   NONE => mapCodetree (optimise(context, [UseGeneral])) base
-        in
-            SOME(Indirect{base = optBase, offset = offset, indKind = IndTuple})
-        end
+        |   doOptimise use (Eval {function = Cond(i, t, e), argList, resultType}) =
+            let
+                (* Transform "(if i then t else e) x" into "if i then t x else e x".  This
+                   allows for other optimisations and inline expansion. *)
+                (* We duplicate the function arguments which could cause the size of the code
+                   to blow-up if they involve complicated expressions. *)
+                fun pushFunction l =
+                    optimise(context, Eval{function=l, argList=argList, resultType=resultType}, use)
+            in
+                reprocess := true;
+                codeTreePrinter(PrettyString "Optimiser: Eval(if...) => if ... Eval else Eval");
+                SOME(Cond(i, pushFunction t, pushFunction e))
+            end
 
-    |   optimise (context, use) (code as Cond(i, t, e)) =
-        (* If the result of the if-then-else is always taken apart as fields
-           then we are better off taking it apart further down and putting
-           the fields into a container on the stack. *)
-        if List.all(fn UseField _ => true | _ => false) use
-        then SOME(optFields(code, context, use))
-        (* However, if we're not optimising it we must make sure the context for each arm is [UseGeneral]
-           and not the usage for the conditional as a whole.  For example, if we're applying
-           the result of the conditional as a function we nevertheless mustn't optimise either
-           arm as though it was immediately applied to an argument. *)
-        else SOME(Cond(optGeneral context i, optGeneral context t, optGeneral context e))
+        |   doOptimise use (Eval {function, argList, resultType}) =
+            (* If nothing else we need to ensure that "use" is correctly set on
+               the function and arguments and we don't simply pass the original. *)
+            let
+                val args = map (fn (c, t) => (optGeneral context c, t)) argList
+                val argTuples = map #1 args
+            in
+                SOME(
+                    Eval{
+                        function= optimise(context, function, [UseApply(use, argTuples)]),
+                        argList=args, resultType = resultType
+                    })
+            end
 
-    |   optimise (context, use) (code as Handle{exp, handler, exPacketAddr}) =
-        (* Similarly for handlers: if the result is taken apart use a container. *)
-        if List.all(fn UseField _ => true | _ => false) use
-        then SOME(optFields(code, context, use))
-        else SOME(Handle{exp=optGeneral context exp, handler=optGeneral context handler, exPacketAddr=exPacketAddr})
+        |   doOptimise use (Indirect{base, offset, indKind = IndTuple}) =
+            SOME(Indirect{base = optimise(context, base, [UseField(offset, use)]),
+                          offset = offset, indKind = IndTuple})
 
-    |   optimise (context as { makeAddr, reprocess, codeTreePrinter, ...}, use) (code as BeginLoop{loop, arguments}) =
-        let
-            fun mapExp mapUse code =
-                case optimise (context, mapUse) code of
-                    SOME result => result
-                |   NONE => mapCodetree (optimise(context, [UseGeneral])) code
+        |   doOptimise use (code as Cond(i, t, e)) =
+            (* If the result of the if-then-else is always taken apart as fields
+               then we are better off taking it apart further down and putting
+               the fields into a container on the stack. *)
+            if List.all(fn UseField _ => true | _ => false) use
+            then SOME(optFields(code, context, use))
+            (* However, if we're not optimising it we must make sure the context for each arm is [UseGeneral]
+               and not the usage for the conditional as a whole.  For example, if we're applying
+               the result of the conditional as a function we nevertheless mustn't optimise either
+               arm as though it was immediately applied to an argument. *)
+            else SOME(Cond(optGeneral context i, optGeneral context t, optGeneral context e))
 
-            (* If an argument is a tuple and always taken apart within the loop we should
-               replace it with arguments for the fields.  This is the same as detupling
-               function arguments.
-               Note: the simplifier lifts loop variables out of the loop if they are
-               passed through unchanged so we don't need to consider that here. *)
-            fun checkArg(({use, addr, ...}, _) :: rest, argNo) =
-                if List.all (fn UseField _ => true | _ => false) use
-                then
-                let
-                    fun maxField(UseField(i, _), n) = Int.max(i, n) | maxField(_, n) = n
-                    val tupleSize = (List.foldl maxField 0 use) + 1
-                in
-                    SOME (tupleSize, addr, argNo)
-                end
-                else checkArg(rest, argNo+1)
+        |   doOptimise use (code as Handle{exp, handler, exPacketAddr}) =
+            (* Similarly for handlers: if the result is taken apart use a container. *)
+            if List.all(fn UseField _ => true | _ => false) use
+            then SOME(optFields(code, context, use))
+            else SOME(Handle{exp=optGeneral context exp, handler=optGeneral context handler, exPacketAddr=exPacketAddr})
 
-            |   checkArg ([], _) = NONE
+        |   doOptimise use (code as BeginLoop{loop, arguments}) =
+            let
+                (* If an argument is a tuple and always taken apart within the loop we should
+                   replace it with arguments for the fields.  This is the same as detupling
+                   function arguments.
+                   Note: the simplifier lifts loop variables out of the loop if they are
+                   passed through unchanged so we don't need to consider that here. *)
+                fun checkArg(({use, addr, ...}, _) :: rest, argNo) =
+                    if List.all (fn UseField _ => true | _ => false) use
+                    then
+                    let
+                        fun maxField(UseField(i, _), n) = Int.max(i, n) | maxField(_, n) = n
+                        val tupleSize = (List.foldl maxField 0 use) + 1
+                    in
+                        SOME (tupleSize, addr, argNo)
+                    end
+                    else checkArg(rest, argNo+1)
+
+                |   checkArg ([], _) = NONE
             
-            val tupleArgument = checkArg(arguments, 0)
-            (* Replace the original arguments by completely new ones.
-               Before the start of the body add bindings that provide definitions
-               of the old arguments.  For the one we're detupling that will involve
-               making a tuple.  Then find every Loop.  For the Loop we need to
-               replace the original arguments with new ones which will involve
-               passing the original values except for the detupled argument where
-               we need to detuple the value being passed in.
-               To preserve the order of evaluation and ensure that the expression that
-               returns the tuple is evaluated only once we need to bind all the existing
-               arguments to variables and then use the variables in the Loop expression.
-               This appears to add many new bindings and tuples but they will nearly all
-               be eliminated by the simplifier.
-               We don't need to check which of the tuple arguments are used; that
-               can be done later. *)
-        in
-            case tupleArgument of
-                SOME (tupleSize, addrForTuple, argumentNo) =>
-                let
-                    val finalArgLength = List.length arguments + tupleSize - 1
-                    (* Create new addresses for the fields. *)
-                    val tupleAddrs = List.tabulate(tupleSize, fn _ => makeAddr())
+                val tupleArgument = checkArg(arguments, 0)
+                (* Replace the original arguments by completely new ones.
+                   Before the start of the body add bindings that provide definitions
+                   of the old arguments.  For the one we're detupling that will involve
+                   making a tuple.  Then find every Loop.  For the Loop we need to
+                   replace the original arguments with new ones which will involve
+                   passing the original values except for the detupled argument where
+                   we need to detuple the value being passed in.
+                   To preserve the order of evaluation and ensure that the expression that
+                   returns the tuple is evaluated only once we need to bind all the existing
+                   arguments to variables and then use the variables in the Loop expression.
+                   This appears to add many new bindings and tuples but they will nearly all
+                   be eliminated by the simplifier.
+                   We don't need to check which of the tuple arguments are used; that
+                   can be done later. *)
+            in
+                case tupleArgument of
+                    SOME (tupleSize, addrForTuple, argumentNo) =>
+                    let
+                        val finalArgLength = List.length arguments + tupleSize - 1
+                        (* Create new addresses for the fields. *)
+                        val tupleAddrs = List.tabulate(tupleSize, fn _ => makeAddr())
 
-                    (* Deal with the initial values for the loop variables. *)
-                    fun replaceWithTuple [] = ([], [])
-                    |   replaceWithTuple((original as ({value, addr, ...}, _)) :: args) =
-                        let
-                            (* To preserve the evaluation order we have to bind each of the original
-                               arguments to a variable then pass a reference to this variable as the initial
-                               value of the loop variable.  The exception is that we replace the argument
-                               we're tupling with new variables and the value of each of these new variables
-                               is the tuple field. *)
-                            val newAddr = makeAddr()
-                            val dec = Declar{ addr = newAddr, use = [], value = value }
-                            val ext = Extract(LoadLocal newAddr) 
-                            val (restDecs, restArgs) = replaceWithTuple args
+                        (* Deal with the initial values for the loop variables. *)
+                        fun replaceWithTuple [] = ([], [])
+                        |   replaceWithTuple((original as ({value, addr, ...}, _)) :: args) =
+                            let
+                                (* To preserve the evaluation order we have to bind each of the original
+                                   arguments to a variable then pass a reference to this variable as the initial
+                                   value of the loop variable.  The exception is that we replace the argument
+                                   we're tupling with new variables and the value of each of these new variables
+                                   is the tuple field. *)
+                                val newAddr = makeAddr()
+                                val dec = Declar{ addr = newAddr, use = [], value = value }
+                                val ext = Extract(LoadLocal newAddr)
+                                val (restDecs, restArgs) = replaceWithTuple args
                             
-                            fun mkFields([], _) = restArgs
-                            |   mkFields(a :: rest, n) =
-                                    ({addr=a, value=mkInd(n, ext), use=[UseGeneral]}, GeneralType) ::
-                                        mkFields(rest, n+1)
-                        in
-                            if addr = addrForTuple
-                            then (dec :: restDecs, mkFields(tupleAddrs, 0))
-                            else (dec :: restDecs, original :: restArgs)
-                        end
-                    val (decs, newArgs) = replaceWithTuple arguments
+                                fun mkFields([], _) = restArgs
+                                |   mkFields(a :: rest, n) =
+                                        ({addr=a, value=mkInd(n, ext), use=[UseGeneral]}, GeneralType) ::
+                                            mkFields(rest, n+1)
+                            in
+                                if addr = addrForTuple
+                                then (dec :: restDecs, mkFields(tupleAddrs, 0))
+                                else (dec :: restDecs, original :: restArgs)
+                            end
+                        val (decs, newArgs) = replaceWithTuple arguments
 
-                    fun replaceLoop(Loop l) =
-                        let
-                            (* To preserve the evaluation order we need to bind the original arguments
-                               to variables.  Then the transformed arguments are the original arguments
-                               except for detupled argument which is replaced by its fields. *)
-                            val newAddresses = map (fn _ => makeAddr()) l
-                            val extractTuple = Extract(LoadLocal(List.nth(newAddresses, argumentNo)))
-                            val newDecs = ListPair.mapEq(fn((c, _), a) => Declar{addr=a, value=c, use=[]})(l, newAddresses)
-                            fun replaceArgs([], _) = []
-                            |   replaceArgs(arg :: rest, n) =
-                                if n = argumentNo
-                                then List.tabulate(tupleSize, fn i => (mkInd(i, extractTuple), GeneralType)) @ replaceArgs(rest, n+1)
-                                else arg :: replaceArgs(rest, n+1)
-                            val newLoopArgs = replaceArgs(l, 0)
-                            val () = if List.length newLoopArgs <> finalArgLength then raise InternalError "Bad length 1" else ()
-                            val loopBody = Loop newLoopArgs
-                        in
-                            SOME(mkEnv(newDecs, loopBody))
-                        end
-                    |   replaceLoop(l as Lambda _) = SOME l (* Not inside functions *)
-                    |   replaceLoop(l as BeginLoop _) = SOME l (* And not inside inner loops *)
-                    |   replaceLoop _ = NONE
+                        fun replaceLoop(Loop l) =
+                            let
+                                (* To preserve the evaluation order we need to bind the original arguments
+                                   to variables.  Then the transformed arguments are the original arguments
+                                   except for detupled argument which is replaced by its fields. *)
+                                val newAddresses = map (fn _ => makeAddr()) l
+                                val extractTuple = Extract(LoadLocal(List.nth(newAddresses, argumentNo)))
+                                val newDecs = ListPair.mapEq(fn((c, _), a) => Declar{addr=a, value=c, use=[]})(l, newAddresses)
+                                fun replaceArgs([], _) = []
+                                |   replaceArgs(arg :: rest, n) =
+                                    if n = argumentNo
+                                    then List.tabulate(tupleSize, fn i => (mkInd(i, extractTuple), GeneralType)) @ replaceArgs(rest, n+1)
+                                    else arg :: replaceArgs(rest, n+1)
+                                val newLoopArgs = replaceArgs(l, 0)
+                                val () = if List.length newLoopArgs <> finalArgLength then raise InternalError "Bad length 1" else ()
+                                val loopBody = Loop newLoopArgs
+                            in
+                                SOME(mkEnv(newDecs, loopBody))
+                            end
+                        |   replaceLoop(l as Lambda _) = SOME l (* Not inside functions *)
+                        |   replaceLoop(l as BeginLoop _) = SOME l (* And not inside inner loops *)
+                        |   replaceLoop _ = NONE
                     
-                    (* Inside the body we have to construct a tuple for the original argument.
-                       The simplifier will then replace every use of this with a reference to
-                       the new argument. *)
-                    val tupleForBody = mkTuple(map(fn a => Extract(LoadLocal a)) tupleAddrs)
-                    val newLoop =
-                        mkEnv([Declar{addr=addrForTuple, value=tupleForBody, use=[UseGeneral]}], mapCodetree replaceLoop loop)
+                        (* Inside the body we have to construct a tuple for the original argument.
+                           The simplifier will then replace every use of this with a reference to
+                           the new argument. *)
+                        val tupleForBody = mkTuple(map(fn a => Extract(LoadLocal a)) tupleAddrs)
+                        val newLoop =
+                            mkEnv([Declar{addr=addrForTuple, value=tupleForBody, use=[UseGeneral]}], mapCodetree replaceLoop loop)
 
-                    val () = reprocess := true
-                    val () = codeTreePrinter(PrettyString "Optimiser: replace loop")
-                    val () = if List.length newArgs <> finalArgLength then raise InternalError "Bad length 2" else ()
-                in
-                    SOME(mkEnv(decs, BeginLoop{loop=newLoop, arguments=newArgs}))
-                end
+                        val () = reprocess := true
+                        val () = codeTreePrinter(PrettyString "Optimiser: replace loop")
+                        val () = if List.length newArgs <> finalArgLength then raise InternalError "Bad length 2" else ()
+                    in
+                        SOME(mkEnv(decs, BeginLoop{loop=newLoop, arguments=newArgs}))
+                    end
 
-            |   NONE =>
-                (* If the result of the loop is taken apart we should push
-                   this down as well. *)
-                if List.all(fn UseField _ => true | _ => false) use
-                then SOME(optFields(code, context, use))
-                else
-                (* It's unsafe to detuple within a loop since it could potentially leave
-                   a Loop in a non tail position. Currently it's safe to generalize since
-                   the optFields check runs before this but still defensively swap into
-                   using [UseGeneral]. *)
-                SOME(BeginLoop{
-                        loop = mapExp [UseGeneral] loop,
-                        arguments =
-                            map (fn ({value, addr, use=argUse}, t) =>
-                                    ({value=mapExp argUse value, addr=addr, use=argUse}, t))
-                                arguments})
-        end
+                |   NONE =>
+                    (* If the result of the loop is taken apart we should push
+                       this down as well. *)
+                    if List.all(fn UseField _ => true | _ => false) use
+                    then SOME(optFields(code, context, use))
+                    else
+                    (* It's unsafe to detuple within a loop since it could potentially
+                       leave a Loop in a non tail position. Currently it's safe to
+                       generalize since the optFields check runs before this but still
+                       defensively swap into using [UseGeneral]. *)
+                    SOME(BeginLoop{
+                            loop = optimise(context, loop, [UseGeneral]),
+                            arguments =
+                                map (fn ({value, addr, use=argUse}, t) =>
+                                        ({value=optimise(context, value, argUse),
+                                          addr=addr, use=argUse}, t))
+                                    arguments})
+            end
 
-    |   optimise _ _ = NONE
-    
-    and optGeneral context exp = mapCodetree (optimise(context, [UseGeneral])) exp
+        |   doOptimise _ _ = NONE
+
+    in
+        (* The use describes how the result of this node is consumed.  If we don't
+           recognise the node, we can't know how it passes that on to its subtrees so
+           they have to be processed as general values. *)
+        case doOptimise use code of
+            SOME result => result
+        |   NONE => mapCodetree (doOptimise [UseGeneral]) code
+    end
+
+    and optGeneral context exp = optimise(context, exp, [UseGeneral])
 
     and optLambda(
             { maxInlineSize, reprocess, makeAddr, codeTreePrinter, ... },
@@ -1214,7 +1203,7 @@ struct
                     maxInlineSize = maxInlineSize,
                     codeTreePrinter = codeTreePrinter
                 }
-                val optBody = mapCodetree (optimise(optContext, [UseGeneral])) body
+                val optBody = optGeneral optContext body
                 val lambdaRes =
                     {
                         body = optBody,
@@ -1236,7 +1225,7 @@ struct
                     maxInlineSize = maxInlineSize,
                     codeTreePrinter = codeTreePrinter
                 }
-                val optBody = mapCodetree (optimise(optContext, [UseGeneral])) body
+                val optBody = optGeneral optContext body
 
                 (* See if this should be expanded inline.  If we are calling the lambda
                    immediately we try to expand it unless maxInlineSize is zero.  We
@@ -1660,10 +1649,7 @@ struct
                     then (preOptCode, optimisedOnce, simpAgain)
                     else
                     let
-                        val postOptCode =
-                            case optimise (optContext, [UseExport]) preOptCode of
-                                SOME result => result
-                            |   NONE => mapCodetree (optimise(optContext, [UseGeneral])) preOptCode
+                        val postOptCode = optimise(optContext, preOptCode, [UseExport])
                         (* Print the code after the optimiser. *)
                         val () = codeTreePrinter(Pretty.PrettyString "Output of optimiser")
                         val () = codeTreePrinter(BaseCodeTree.pretty postOptCode)
