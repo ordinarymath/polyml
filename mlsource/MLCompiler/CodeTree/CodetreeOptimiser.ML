@@ -804,6 +804,15 @@ struct
     |   mapLambdaResult(bindings, lambda) =
             mkEnv([RecDecs(map(fn(addr, lam) => {addr=addr, use=[], lambda=lam}) bindings)], lambda)
 
+    (* How optimiseResult finishes off a result chain: loop_fn is applied to the
+       arguments of every Loop that belongs to the enclosing BeginLoop.  It is the
+       Loop constructor for an ordinary walk, which makes optimiseResult with
+       valueResult exactly optimise. *)
+    type resultContext =
+        { loop_fn: (codetree * argumentType) list -> codetree }
+
+    val valueResult: resultContext = { loop_fn = Loop }
+
     fun optimise (context, code, use) =
     let
         val { reprocess, makeAddr, codeTreePrinter, maxInlineSize = _ } = context
@@ -812,7 +821,7 @@ struct
                 SOME(mapLambdaResult(optLambda(context, use, lambda, LCNormal)))
 
         |   doOptimise use (Newenv(envDecs, envExp)) =
-                SOME(optimiseNewenv(context, envDecs, envExp, use))
+                SOME(optimiseNewenv(context, valueResult, envDecs, envExp, use))
 
             (* Immediate call to a function.  We may be able to expand this inline unless it
                is recursive. *)
@@ -863,7 +872,7 @@ struct
                then we are better off taking it apart further down and putting
                the fields into a container on the stack. *)
             if List.all(fn UseField _ => true | _ => false) use
-            then SOME(optFields(code, context, use))
+            then SOME(optFields(code, context, valueResult, use))
             (* However, if we're not optimising it we must make sure the context for each arm is [UseGeneral]
                and not the usage for the conditional as a whole.  For example, if we're applying
                the result of the conditional as a function we nevertheless mustn't optimise either
@@ -873,7 +882,7 @@ struct
         |   doOptimise use (code as Handle{exp, handler, exPacketAddr}) =
             (* Similarly for handlers: if the result is taken apart use a container. *)
             if List.all(fn UseField _ => true | _ => false) use
-            then SOME(optFields(code, context, use))
+            then SOME(optFields(code, context, valueResult, use))
             else SOME(Handle{exp=optGeneral context exp, handler=optGeneral context handler, exPacketAddr=exPacketAddr})
 
         |   doOptimise use (code as BeginLoop{loop, arguments}) =
@@ -882,8 +891,8 @@ struct
                again with [UseGeneral], which is where the detupling below then
                happens, so we do not lose it. *)
             if List.all(fn UseField _ => true | _ => false) use
-            then SOME(optFields(code, context, use))
-            else SOME(optimiseBeginLoop(context, loop, arguments))
+            then SOME(optFields(code, context, valueResult, use))
+            else SOME(optimiseBeginLoop(context, valueResult, loop, arguments))
 
         |   doOptimise _ _ = NONE
 
@@ -898,7 +907,44 @@ struct
 
     and optGeneral context exp = optimise(context, exp, [UseGeneral])
 
-    and optimiseBeginLoop (context as { reprocess, makeAddr, codeTreePrinter, ...}, loop, arguments) =
+    (* Optimise a result position of the enclosing BeginLoop, applying the tail hook
+       to every Loop that belongs to it. *)
+    and optimiseResult (context, tailContext as { loop_fn }, code, use) =
+    let
+        val use = case use of [] => [UseGeneral] | _ => use
+        fun allFields use = List.all(fn UseField _ => true | _ => false) use
+    in
+        case code of
+            Loop args =>
+                loop_fn(map (fn (c, t) => (optGeneral context c, t)) args)
+
+        |   Newenv(envDecs, envExp) => optimiseNewenv(context, tailContext, envDecs, envExp, use)
+
+        |   BeginLoop{loop, arguments} =>
+                if allFields use
+                then optFields(code, context, tailContext, use)
+                else optimiseBeginLoop(context, tailContext, loop, arguments)
+
+        |   Cond(i, t, e) =>
+                if allFields use
+                then optFields(code, context, tailContext, use)
+                else
+                Cond(optGeneral context i,
+                     optimiseResult(context, tailContext, t, [UseGeneral]),
+                     optimiseResult(context, tailContext, e, [UseGeneral]))
+
+        |   Handle{exp, handler, exPacketAddr} =>
+                if allFields use
+                then optFields(code, context, tailContext, use)
+                else
+                Handle{exp = optimiseResult(context, valueResult, exp, [UseGeneral]),
+                       handler = optimiseResult(context, tailContext, handler, [UseGeneral]),
+                       exPacketAddr = exPacketAddr}
+
+        |   _ => optimise(context, code, use)
+    end
+
+    and optimiseBeginLoop (context as { reprocess, makeAddr, codeTreePrinter, ...}, tailContext, loop, arguments) =
     let
         (* It's unsafe to detuple within a loop since it could potentially
            leave a Loop in a non tail position. Currently it's safe to
@@ -957,7 +1003,7 @@ struct
                            we're tupling with new variables and the value of each of these new variables
                            is the tuple field. *)
                         val newAddr = makeAddr()
-                        val dec = Declar{ addr = newAddr, use = [], value = value }
+                        val dec = Declar{ addr = newAddr, use = [UseGeneral], value = value }
                         val ext = Extract(LoadLocal newAddr)
                         val (restDecs, restArgs) = replaceWithTuple args
 
@@ -972,35 +1018,35 @@ struct
                     end
                 val (decs, newArgs) = replaceWithTuple arguments
 
-                fun replaceLoop(Loop l) =
+                (* The tail context for the body: applied to every Loop that belongs
+                   to this BeginLoop. *)
+                fun detupleLoopArgs args =
                     let
                         (* To preserve the evaluation order we need to bind the original arguments
                            to variables.  Then the transformed arguments are the original arguments
                            except for detupled argument which is replaced by its fields. *)
-                        val newAddresses = map (fn _ => makeAddr()) l
+                        val newAddresses = map (fn _ => makeAddr()) args
                         val extractTuple = Extract(LoadLocal(List.nth(newAddresses, argumentNo)))
-                        val newDecs = ListPair.mapEq(fn((c, _), a) => Declar{addr=a, value=c, use=[]})(l, newAddresses)
+                        val newDecs = ListPair.mapEq(fn((c, _), a) => Declar{addr=a, value=c, use=[UseGeneral]})(args, newAddresses)
                         fun replaceArgs([], _) = []
                         |   replaceArgs(arg :: rest, n) =
                             if n = argumentNo
                             then List.tabulate(tupleSize, fn i => (mkInd(i, extractTuple), GeneralType)) @ replaceArgs(rest, n+1)
                             else arg :: replaceArgs(rest, n+1)
-                        val newLoopArgs = replaceArgs(l, 0)
+                        val newLoopArgs = replaceArgs(args, 0)
                         val () = if List.length newLoopArgs <> finalArgLength then raise InternalError "Bad length 1" else ()
                         val loopBody = Loop newLoopArgs
                     in
-                        SOME(mkEnv(newDecs, loopBody))
+                        mkEnv(newDecs, loopBody)
                     end
-                |   replaceLoop(l as Lambda _) = SOME l (* Not inside functions *)
-                |   replaceLoop(l as BeginLoop _) = SOME l (* And not inside inner loops *)
-                |   replaceLoop _ = NONE
 
                 (* Inside the body we have to construct a tuple for the original argument.
                    The simplifier will then replace every use of this with a reference to
                    the new argument. *)
                 val tupleForBody = mkTuple(map(fn a => Extract(LoadLocal a)) tupleAddrs)
                 val newLoop =
-                    mkEnv([Declar{addr=addrForTuple, value=tupleForBody, use=[UseGeneral]}], mapCodetree replaceLoop loop)
+                    mkEnv([Declar{addr=addrForTuple, value=tupleForBody, use=[UseGeneral]}],
+                          optimiseResult(context, { loop_fn = detupleLoopArgs }, loop, use))
 
                 val () = reprocess := true
                 val () = codeTreePrinter(PrettyString "Optimiser: replace loop")
@@ -1010,6 +1056,8 @@ struct
             end
 
         |   NONE =>
+            (* Both the body and the initial values take the default tail
+               context: their Loops are ours, not the enclosing loop's. *)
             BeginLoop{
                     loop = optimise(context, loop, use),
                     arguments =
@@ -1020,7 +1068,7 @@ struct
     end
 
 
-    and optimiseNewenv (context as { reprocess, makeAddr, codeTreePrinter, ...}, envDecs, envExp, use) =
+    and optimiseNewenv (context as { reprocess, makeAddr, codeTreePrinter, ...}, tailContext, envDecs, envExp, use) =
     let
         fun mapbinding(Declar{value, addr, use}) =
                 Declar{value=optimise(context, value, use), addr=addr, use=use}
@@ -1142,7 +1190,7 @@ struct
                     else Container{addr=addr, use=use, size=size, setter = optGeneral context setter}
             end
     in
-        Newenv(map mapbinding envDecs, optimise(context, envExp, use))
+        Newenv(map mapbinding envDecs, optimiseResult(context, tailContext, envExp, use))
     end
 
     and optLambda(
@@ -1404,7 +1452,7 @@ struct
             end
     end
 
-    and optFields (code, context as { reprocess, makeAddr, codeTreePrinter, ...}, use) =
+    and optFields (code, context as { reprocess, makeAddr, codeTreePrinter, ...}, tailContext, use) =
     let
         (* We have an if-then-else or a loop whose result is only ever
            taken apart.  We push this down. *)
@@ -1451,7 +1499,7 @@ struct
                    reconstruct one with unused fields set to zero.  They will
                    be filtered out later by the simplifier pass. *)
                 val field =
-                    optGeneral context (pushContainer(code, fn t => mkInd(offset, t)))
+                    optimiseResult(context, tailContext, pushContainer(code, fn t => mkInd(offset, t)), [UseGeneral])
                 fun mkFields n = if n = offset then field else CodeZero
             in
                 Tuple{ fields = List.tabulate(offset+1, mkFields), isVariant = false }
@@ -1467,7 +1515,7 @@ struct
                 fun setContainer tuple = (* At the leaf set the container. *)
                     SetContainer{container = loadContainer, tuple = tuple, filter = fieldsToFilter useList }
 
-                val setCode = optGeneral context (pushContainer(code, setContainer))
+                val setCode = optimiseResult(context, tailContext, pushContainer(code, setContainer), [UseGeneral])
                 val makeContainer =
                     Container{addr=containerAddr, use=[], size=width, setter=setCode}
                 (* The context requires a tuple of the original width.  We need
