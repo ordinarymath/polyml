@@ -956,7 +956,7 @@ struct
             in
                 reprocess := true;
                 codeTreePrinter(PrettyString "Optimiser: Eval(if...) => if ... Eval else Eval");
-                SOME(Cond(i, pushFunction t, pushFunction e))
+                SOME(Cond(optGeneral context i, pushFunction t, pushFunction e))
             end
 
         |   doOptimise use (Eval {function, argList, resultType}) =
